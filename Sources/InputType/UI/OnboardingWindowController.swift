@@ -15,19 +15,39 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 
     func showIfNeeded() {
         let settings = InputSettings.shared
-        guard !settings.hasCompletedOnboarding else { return }
+        let shortVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+        let buildVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        let currentFullVersion = "\(shortVer) (\(buildVer))"
 
-        let axGranted = AXIsProcessTrusted()
-        let micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        if axGranted && micGranted {
-            settings.hasCompletedOnboarding = true
+        if !settings.hasCompletedOnboarding {
+            settings.lastLaunchedVersion = currentFullVersion
+            let axGranted = AXIsProcessTrusted()
+            let micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            if axGranted && micGranted {
+                settings.hasCompletedOnboarding = true
+                return
+            }
+            show(initialStep: .addInputSource, openSettingsOnFinish: true)
             return
         }
 
-        show(openSettingsOnFinish: true)
+        // Post-update check: if app version changed and Accessibility permission was invalidated
+        // (due to ad-hoc signing CDHash change), clean stale TCC entry and show quick re-auth card.
+        let previousVersion = settings.lastLaunchedVersion
+        if previousVersion != currentFullVersion {
+            settings.lastLaunchedVersion = currentFullVersion
+            if !previousVersion.isEmpty && !AXIsProcessTrusted() {
+                let reset = Process()
+                reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+                reset.arguments = ["reset", "Accessibility", Bundle.main.bundleIdentifier ?? "com.lumocore.inputmethod.PrimeType"]
+                try? reset.run()
+                reset.waitUntilExit()
+                show(initialStep: .accessibility, openSettingsOnFinish: false)
+            }
+        }
     }
 
-    func show(openSettingsOnFinish: Bool = true) {
+    func show(initialStep: OnboardingStep = .addInputSource, openSettingsOnFinish: Bool = true) {
         if let existing = window {
             NSApp.activate(ignoringOtherApps: true)
             existing.makeKeyAndOrderFront(nil)
@@ -35,6 +55,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         }
 
         let contentView = OnboardingWizardView(
+            initialStep: initialStep,
+            openSettingsOnFinish: openSettingsOnFinish,
             onFinish: { [weak self] in
                 InputSettings.shared.hasCompletedOnboarding = true
                 self?.close()
@@ -72,7 +94,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-private enum OnboardingStep: Int, CaseIterable {
+enum OnboardingStep: Int, CaseIterable {
     case addInputSource = 0
     case microphone = 1
     case voiceShortcut = 2
@@ -84,15 +106,22 @@ private enum OnboardingStep: Int, CaseIterable {
 }
 
 private struct OnboardingWizardView: View {
+    let openSettingsOnFinish: Bool
     let onFinish: () -> Void
 
     @ObservedObject private var settings = InputSettings.shared
-    @State private var step: OnboardingStep = .addInputSource
+    @State private var step: OnboardingStep
     @State private var inputSourceAdded: Bool = Self.checkInputSourceEnabled()
     @State private var micStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
     @State private var axGranted: Bool = AXIsProcessTrusted()
     @State private var isRecordingShortcut = false
     @State private var shortcutMonitor: Any?
+
+    init(initialStep: OnboardingStep = .addInputSource, openSettingsOnFinish: Bool = true, onFinish: @escaping () -> Void) {
+        self.openSettingsOnFinish = openSettingsOnFinish
+        self.onFinish = onFinish
+        self._step = State(initialValue: initialStep)
+    }
 
     private let pollTimer = Timer.publish(every: 0.8, on: .main, in: .common).autoconnect()
     private let brandBlue = Color(red: 0.27, green: 0.51, blue: 0.99)

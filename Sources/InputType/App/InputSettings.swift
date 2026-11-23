@@ -510,6 +510,7 @@ private struct PersistedSettings: Codable {
     // Updates
     var autoCheckAppUpdates: Bool = true
     var hasCompletedOnboarding: Bool = false
+    var lastLaunchedVersion: String = ""
     var autoUpdateDictionaries: Bool = false
 
     // Advanced
@@ -589,6 +590,7 @@ private struct PersistedSettings: Codable {
         rewriteSystemPrompt = try c.decodeIfPresent(String.self, forKey: .rewriteSystemPrompt) ?? InputSettings.defaultRewriteSystemPrompt
         autoCheckAppUpdates = try c.decodeIfPresent(Bool.self, forKey: .autoCheckAppUpdates) ?? true
         hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false
+        lastLaunchedVersion = try c.decodeIfPresent(String.self, forKey: .lastLaunchedVersion) ?? ""
         autoUpdateDictionaries = try c.decodeIfPresent(Bool.self, forKey: .autoUpdateDictionaries) ?? false
         smartEmailURLCompletion = try c.decodeIfPresent(Bool.self, forKey: .smartEmailURLCompletion) ?? true
     }
@@ -686,6 +688,7 @@ final class InputSettings: ObservableObject {
     // Updates
     @Published var autoCheckAppUpdates: Bool { didSet { save() } }
     @Published var hasCompletedOnboarding: Bool { didSet { save() } }
+    @Published var lastLaunchedVersion: String { didSet { save() } }
     @Published var autoUpdateDictionaries: Bool { didSet { save() } }
 
     // Advanced
@@ -766,6 +769,7 @@ final class InputSettings: ObservableObject {
         self.rewriteSystemPrompt = loaded.rewriteSystemPrompt
         self.autoCheckAppUpdates = loaded.autoCheckAppUpdates
         self.hasCompletedOnboarding = loaded.hasCompletedOnboarding
+        self.lastLaunchedVersion = loaded.lastLaunchedVersion
         self.autoUpdateDictionaries = loaded.autoUpdateDictionaries
         self.smartEmailURLCompletion = loaded.smartEmailURLCompletion
 
@@ -893,6 +897,7 @@ final class InputSettings: ObservableObject {
         payload.rewriteSystemPrompt = rewriteSystemPrompt
         payload.autoCheckAppUpdates = autoCheckAppUpdates
         payload.hasCompletedOnboarding = hasCompletedOnboarding
+        payload.lastLaunchedVersion = lastLaunchedVersion
         payload.autoUpdateDictionaries = autoUpdateDictionaries
         payload.smartEmailURLCompletion = smartEmailURLCompletion
 
@@ -1141,6 +1146,7 @@ final class InputSettings: ObservableObject {
         rewriteSystemPrompt = loaded.rewriteSystemPrompt
         autoCheckAppUpdates = loaded.autoCheckAppUpdates
         hasCompletedOnboarding = loaded.hasCompletedOnboarding
+        lastLaunchedVersion = loaded.lastLaunchedVersion
         autoUpdateDictionaries = loaded.autoUpdateDictionaries
         smartEmailURLCompletion = loaded.smartEmailURLCompletion
     }

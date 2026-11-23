@@ -1820,7 +1820,7 @@ final class VoiceInputManager: ObservableObject {
                 recorder.startPreRoll(microphoneUID: settings.voiceMicrophoneUID)
             }
 
-            if code == holdCode {
+            if code == holdCode && !isRecording && !isRecognizing {
                 holdTimer?.invalidate()
                 // When the hold key is distinct from the tap key, use a snappy 120ms threshold;
                 // when both share the same modifier key, use 170ms to distinguish tap vs hold.
@@ -1840,13 +1840,13 @@ final class VoiceInputManager: ObservableObject {
             holdKeyDownCode = nil
             holdTimer?.invalidate()
             holdTimer = nil
-            let tapLimit: TimeInterval = (holdCode == nil) ? 0.45 : Self.holdThreshold
+            let tapLimit: TimeInterval = (code == holdCode) ? 0.22 : 0.60
             if holdTriggeredRecording {
                 holdTriggeredRecording = false
                 if isRecording {
                     finishRecording()
                 }
-            } else if code == tapModifierCode && elapsed < tapLimit {
+            } else if code == tapModifierCode && (isRecording || isRecognizing || elapsed < tapLimit) {
                 toggleTapRecording()
             } else {
                 recorder.cancelPreRoll()
