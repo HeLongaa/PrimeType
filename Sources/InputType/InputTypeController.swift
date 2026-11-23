@@ -675,6 +675,15 @@ final class InputTypeController: IMKInputController {
         return (0x30...0x39).contains(scalar.value)
     }
 
+    private func isChinesePunctuation(_ ch: Character) -> Bool {
+        let puncts: Set<Character> = [
+            "，", "。", "、", "；", "：", "！", "？",
+            "（", "）", "【", "】", "《", "》",
+            "“", "”", "‘", "’", "「", "」", "『", "』", "…", "—"
+        ]
+        return puncts.contains(ch)
+    }
+
     private func shouldInsertAutoSpace(previous: Character?, next: Character?) -> Bool {
         guard let previous, let next else { return false }
         let settings = InputSettings.shared
@@ -686,7 +695,7 @@ final class InputTypeController: IMKInputController {
         }
         if settings.autoSpaceChineseNumber {
             if (isHanCharacter(previous) && isASCIIDigit(next)) ||
-               (isASCIIDigit(previous) && isHanCharacter(next)) {
+               (isASCIIDigit(previous) && (isHanCharacter(next) || isChinesePunctuation(next))) {
                 return true
             }
         }
@@ -1535,6 +1544,22 @@ final class InputTypeController: IMKInputController {
         let sel = Selector(("expand"))
         if candidatesWin.responds(to: sel) {
             candidatesWin.perform(sel)
+            if let ctrl = candidatesWin.value(forKey: "expandableWindowController") as? NSWindowController {
+                let sortingBarSel = NSSelectorFromString("sortingBarView")
+                if ctrl.responds(to: sortingBarSel),
+                   let bar = ctrl.perform(sortingBarSel)?.takeUnretainedValue() as? NSView {
+                    bar.isHidden = false
+                    if let win = ctrl.window {
+                        let barH = max(bar.frame.height, 28)
+                        var frame = win.frame
+                        if bar.frame.minY < 2 {
+                            frame.origin.y -= barH
+                            frame.size.height += barH
+                            win.setFrame(frame, display: true)
+                        }
+                    }
+                }
+            }
             elevateCandidateWindow(candidatesWin)
         }
     }
