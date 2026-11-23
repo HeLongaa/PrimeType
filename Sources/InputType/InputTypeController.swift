@@ -1503,6 +1503,7 @@ final class InputTypeController: IMKInputController {
     }
 
     private func hideCandidatesImmediately() {
+        UpdateBadgeOverlayController.shared.hide()
         guard let candidatesWin = AppDelegate.sharedCandidates else { return }
         NSAnimationContext.beginGrouping()
         NSAnimationContext.current.duration = 0
@@ -2407,6 +2408,9 @@ final class InputTypeController: IMKInputController {
                         elevateCandidateWindow(candidatesWin)
                     } else {
                         candidatesWin.update()
+                    }
+                    if AppUpdateManager.shared.hasUpdate {
+                        UpdateBadgeOverlayController.shared.showIfAvailable(below: ctrl?.window)
                     }
                     if let win = ctrl?.window, win.isVisible,
                        win.frame.origin.x != 0 || win.frame.origin.y != 0 {
