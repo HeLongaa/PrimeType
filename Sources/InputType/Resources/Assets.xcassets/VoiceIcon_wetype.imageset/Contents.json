@@ -1,0 +1,18 @@
+{
+  "images" : [
+    {
+      "filename" : "VoiceIcon_wetype_1x.png",
+      "idiom" : "mac",
+      "scale" : "1x"
+    },
+    {
+      "filename" : "VoiceIcon_wetype_2x.png",
+      "idiom" : "mac",
+      "scale" : "2x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "images" : [
+    {
+      "filename" : "VoiceIcon_chatterfly_1x.png",
+      "idiom" : "mac",
+      "scale" : "1x"
+    },
+    {
+      "filename" : "VoiceIcon_chatterfly_2x.png",
+      "idiom" : "mac",
+      "scale" : "2x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
