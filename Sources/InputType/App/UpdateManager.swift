@@ -117,14 +117,22 @@ final class AppUpdateManager: ObservableObject {
                 let zipURL = tmpDir.appendingPathComponent("PrimeType.zip")
 
                 var req = URLRequest(url: url)
-                req.timeoutInterval = 180
+                req.timeoutInterval = 300
                 req.setValue("PrimeType/\(self.currentVersion)", forHTTPHeaderField: "User-Agent")
 
-                let (downloadedTmp, response) = try await URLSession.shared.download(for: req)
-                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    throw NSError(domain: "AppUpdateManager", code: http.statusCode, userInfo: [
-                        NSLocalizedDescriptionKey: "下载失败 (HTTP \(http.statusCode))"
-                    ])
+                let downloadedTmp = try await Self.downloadFileWithProgress(request: req) { written, total in
+                    Task { @MainActor in
+                        if total > 0 {
+                            let ratio = min(max(Double(written) / Double(total), 0), 1)
+                            self.downloadProgress = ratio * 0.80
+                            let mbWritten = Double(written) / (1024 * 1024)
+                            let mbTotal = Double(total) / (1024 * 1024)
+                            self.statusMessage = String(format: "正在下载更新包… %.1f MB / %.1f MB (%.0f%%)", mbWritten, mbTotal, ratio * 100)
+                        } else {
+                            let mbWritten = Double(written) / (1024 * 1024)
+                            self.statusMessage = String(format: "正在下载更新包… %.1f MB", mbWritten)
+                        }
+                    }
                 }
                 if fm.fileExists(atPath: zipURL.path) {
                     try fm.removeItem(at: zipURL)
@@ -132,7 +140,7 @@ final class AppUpdateManager: ObservableObject {
                 try fm.moveItem(at: downloadedTmp, to: zipURL)
 
                 await MainActor.run {
-                    self.downloadProgress = 0.65
+                    self.downloadProgress = 0.85
                     self.statusMessage = "正在解压更新包…"
                 }
 
@@ -219,6 +227,78 @@ final class AppUpdateManager: ObservableObject {
                     self.statusMessage = "更新失败：\(error.localizedDescription)"
                 }
             }
+        }
+    }
+
+    private static func downloadFileWithProgress(
+        request: URLRequest,
+        onProgress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> URL {
+        final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
+            let onProgress: @Sendable (Int64, Int64) -> Void
+            var continuation: CheckedContinuation<URL, Error>?
+            var downloadedLocation: URL?
+
+            init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+                self.onProgress = onProgress
+            }
+
+            func urlSession(
+                _ session: URLSession,
+                downloadTask: URLSessionDownloadTask,
+                didWriteData bytesWritten: Int64,
+                totalBytesWritten: Int64,
+                totalBytesExpectedToWrite: Int64
+            ) {
+                onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+            }
+
+            func urlSession(
+                _ session: URLSession,
+                downloadTask: URLSessionDownloadTask,
+                didFinishDownloadingTo location: URL
+            ) {
+                let tmpCopy = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("PrimeTypeDL-\(UUID().uuidString).zip")
+                do {
+                    try FileManager.default.moveItem(at: location, to: tmpCopy)
+                    downloadedLocation = tmpCopy
+                } catch {
+                    continuation?.resume(throwing: error)
+                    continuation = nil
+                }
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                session.finishTasksAndInvalidate()
+                guard let cont = continuation else { return }
+                continuation = nil
+                if let error {
+                    cont.resume(throwing: error)
+                    return
+                }
+                if let http = task.response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    cont.resume(throwing: NSError(domain: "AppUpdateManager", code: http.statusCode, userInfo: [
+                        NSLocalizedDescriptionKey: "下载失败 (HTTP \(http.statusCode))"
+                    ]))
+                    return
+                }
+                if let url = downloadedLocation {
+                    cont.resume(returning: url)
+                } else {
+                    cont.resume(throwing: NSError(domain: "AppUpdateManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "未获取到下载文件"
+                    ]))
+                }
+            }
+        }
+
+        let delegate = DownloadDelegate(onProgress: onProgress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        return try await withCheckedThrowingContinuation { cont in
+            delegate.continuation = cont
+            let task = session.downloadTask(with: request)
+            task.resume()
         }
     }
 
