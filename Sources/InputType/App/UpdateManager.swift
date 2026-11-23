@@ -66,7 +66,7 @@ final class AppUpdateManager: ObservableObject {
                 let assets = json?["assets"] as? [[String: Any]] ?? []
                 let zipAssetURL = assets.first(where: { asset in
                     let name = (asset["name"] as? String ?? "").lowercased()
-                    return name.hasSuffix(".zip") && name.contains("primetype")
+                    return name.hasSuffix(".zip") && name.contains("primetype") && !name.contains("installer")
                 })?["browser_download_url"] as? String
                 ?? assets.first(where: { asset in
                     (asset["name"] as? String ?? "").lowercased().hasSuffix(".zip")

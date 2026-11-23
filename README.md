@@ -23,11 +23,13 @@ PrimeType 是一个面向 macOS 的开源中文输入法，底层使用 `librime
 
 ### 方式一：直接下载安装包（推荐）
 
-前往 [GitHub Releases](https://github.com/HeLongaa/PrimeType/releases/latest) 下载最新的 `PrimeType-v*.pkg` 双击安装：
+前往 [GitHub Releases](https://github.com/HeLongaa/PrimeType/releases/latest) 下载最新的 `PrimeTypeInstaller-v*.zip`，解压后双击 `PrimeTypeInstaller.app`：
 
-1. 安装包会自动将 `PrimeType.app` 安装至 `/Library/Input Methods/` 并注册输入法；
-2. 首次启动会自动弹出**安装引导窗口**，引导开启「启用输入法」「辅助功能」与「麦克风」权限；
+1. 点击「安装」并输入管理员密码，自动将 `PrimeType.app` 安装至 `/Library/Input Methods/`；
+2. 随后自动进入 4 步图形化引导向导，依次完成「添加输入法」「麦克风权限」「语音快捷键」与「辅助功能权限」配置；
 3. 后续可在「Prime 输入法设置 → 更新」中一键检查并自动更新软件与词库。
+
+> **提示**：首次全新安装后，如果个别之前已经打开的应用（如 Chrome、VS Code、Electron 类应用）暂时无法切换或输入，重启一次该应用即可正常使用；后续通过应用内自动更新升级无需重启。
 
 ### 方式二：从源码编译
 

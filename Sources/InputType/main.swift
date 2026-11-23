@@ -121,10 +121,15 @@ ClipboardManager.shared.syncWithSettings()
 HotKeyManager.shared.start {
     ClipboardPanelController.shared.toggle()
 }
+let launchOnboarding = CommandLine.arguments.contains("--onboarding")
 VoiceInputManager.shared.startMonitors()
 TranslateManager.shared.startMonitors()
-DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-    OnboardingWindowController.shared.showIfNeeded()
+DispatchQueue.main.asyncAfter(deadline: .now() + (launchOnboarding ? 0.2 : 0.8)) {
+    if launchOnboarding {
+        OnboardingWindowController.shared.show(openSettingsOnFinish: true)
+    } else {
+        OnboardingWindowController.shared.showIfNeeded()
+    }
 }
 if InputSettings.shared.autoCheckAppUpdates {
     DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
