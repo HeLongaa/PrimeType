@@ -165,12 +165,8 @@ final class AppUpdateManager: ObservableObject {
                 let parentDir = "/Library/Input Methods"
                 let installScript = """
                 set -e
-                rm -rf "\(installTarget).old"
-                if [ -d "\(installTarget)" ]; then
-                  mv "\(installTarget)" "\(installTarget).old"
-                fi
-                ditto "\(newAppURL.path)" "\(installTarget)"
-                rm -rf "\(installTarget).old"
+                mkdir -p "\(installTarget)"
+                rsync -a --delete "\(newAppURL.path)/" "\(installTarget)/"
                 xattr -dr com.apple.quarantine "\(installTarget)" 2>/dev/null || true
                 """
 

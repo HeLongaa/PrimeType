@@ -149,14 +149,9 @@ private struct InstallerRootView: View {
         let targetApp = "/Library/Input Methods/PrimeType.app"
         let shellScript = """
         set -e
-        mkdir -p "/Library/Input Methods"
+        mkdir -p "\(targetApp)"
         killall PrimeType 2>/dev/null || true
-        rm -rf "\(targetApp).old"
-        if [ -d "\(targetApp)" ]; then
-          mv "\(targetApp)" "\(targetApp).old"
-        fi
-        ditto "\(sourceURL.path)" "\(targetApp)"
-        rm -rf "\(targetApp).old"
+        rsync -a --delete "\(sourceURL.path)/" "\(targetApp)/"
         xattr -dr com.apple.quarantine "\(targetApp)" 2>/dev/null || true
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -R -trusted "\(targetApp)" 2>/dev/null || true
         """
