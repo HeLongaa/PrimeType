@@ -37,19 +37,10 @@ xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 # Restart any previous instance so macOS loads the new version
 killall PrimeType 2>/dev/null || true
 
-# Register & enable the input source as the console user
+# Register & enable the input source as the console user using PrimeType's own binary (no Xcode/Swift CLT required)
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
-  su - "$CONSOLE_USER" -c '
-    /usr/bin/swift -e "
-      import Carbon
-      let filter = [kTISPropertyInputSourceID as String: \"com.lumocore.inputmethod.PrimeType.pinyin\"] as CFDictionary
-      if let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource], let src = list.first {
-        TISEnableInputSource(src)
-        TISSelectInputSource(src)
-      }
-    " >/dev/null 2>&1 || true
-  ' &
+  su - "$CONSOLE_USER" -c "\"$APP/Contents/MacOS/PrimeType\" --register-input-source >/dev/null 2>&1 || true" &
 fi
 exit 0
 EOF

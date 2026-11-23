@@ -1,5 +1,18 @@
+import Carbon
 import Cocoa
 import InputMethodKit
+
+if CommandLine.arguments.contains("--register-input-source") {
+    let appURL = URL(fileURLWithPath: "/Library/Input Methods/PrimeType.app") as CFURL
+    TISRegisterInputSource(appURL)
+    let filter = [kTISPropertyInputSourceID as String: "com.lumocore.inputmethod.PrimeType.pinyin"] as CFDictionary
+    if let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource],
+       let src = list.first {
+        TISEnableInputSource(src)
+        TISSelectInputSource(src)
+    }
+    exit(0)
+}
 
 if CommandLine.arguments.contains("--voice-test") {
     exit(VoiceEngineTestRunner.runCLI(arguments: CommandLine.arguments))
