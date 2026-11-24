@@ -1114,26 +1114,34 @@ final class InputSettings: ObservableObject {
             lines.append("  grammar/non_collocation_penalty: -6")
             lines.append("  grammar/weak_collocation_penalty: -100")
             lines.append("  grammar/rear_penalty: -18")
-            lines.append("  translator/contextual_suggestions: true")
-            lines.append("  translator/max_homophones: 7")
+            // Respect wanxiang's own tuned translator defaults (`contextual_suggestions: false`, `max_homophones: 8`);
+            // enable contextual suggestions for rimeIce / ohMyRime where the base schema doesn't configure grammar.
+            if preset != .wanxiang {
+                lines.append("  translator/contextual_suggestions: true")
+                lines.append("  translator/max_homophones: 7")
+            }
         }
 
-        // Combine fuzzy pinyin + safe zero-collision Rime native typo correction rules
+        // Combine fuzzy pinyin + clean zero-collision Rime algebra rules
         var extraAlgebra: [String] = []
+        if preset == .wanxiang {
+            // Wanxiang's base algebra omits `r` from `abbrev/^([aoe])([ioun])(\d)$/$1/`, causing `fan'e` to miss `反而`
+            // and fall back to rare `反俄`. Adding `abbrev/^er$/e/` aligns `er` with `rime_ice` with zero side effects.
+            extraAlgebra.append("abbrev/^er$/e/")
+        }
         if fuzzyPinyinEnabled && !fuzzyRules.isEmpty {
             for rule in FuzzyPinyinRule.allCases where fuzzyRules.contains(rule) {
                 extraAlgebra.append(contentsOf: rule.algebraRules)
             }
         }
-        if typoCorrectionEnabled {
-            // Zero-collision Rime algebra derivations (exact matches always stay unaffected, no normal long-sentence regression);
-            // adjacent-key, transposition, extra-key, and missing-vowel typos are handled surgically by PinyinTypoAugmenter.
+        if typoCorrectionEnabled && preset != .wanxiang {
+            // Wanxiang already ships 60+ curated native algebra rules; for rimeIce / ohMyRime add only
+            // strictly zero-collision final-transposition derivations (no doubled-initial rule that collides with `xx/gg/mm`).
             extraAlgebra.append(contentsOf: [
                 "derive/([aoei])ng$/$1gn/",
                 "derive/([aoei])ng$/$1mg/",
                 "derive/ian$/ina/",
-                "derive/uan$/una/",
-                "derive/^([bpmfdtnlgkhjqxzcsw])/$1$1/"
+                "derive/uan$/una/"
             ])
         }
         if !extraAlgebra.isEmpty {

@@ -697,11 +697,6 @@ final class InputTypeController: IMKInputController {
         // enable_backspace_limit) can swallow Backspace and make deletion stop working (e.g. in Spotlight).
         if event.keyCode == 0x33 || event.keyCode == 0x75 {
             if event.keyCode == 0x33 && mods.isEmpty {
-                if settings.personalRankingEnabled {
-                    UserRankingEngine.shared.recordBackspaceAfterCommit(
-                        isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
-                    )
-                }
                 if !currentLineBuffer.isEmpty {
                     currentLineBuffer.removeLast()
                     lastCommittedChar = currentLineBuffer.last
@@ -709,14 +704,10 @@ final class InputTypeController: IMKInputController {
                     lastCommittedChar = nil
                 }
             } else {
-                UserRankingEngine.shared.noteNonDeleteActivity()
                 resetInputContextTracking()
             }
             return false
         }
-
-        // Non-delete key clears pending immediate-delete negative-feedback window
-        UserRankingEngine.shared.noteNonDeleteActivity()
 
         // Navigation, Escape, and Tab keys when NOT composing pass straight through to the host app
         if [0x7b, 0x7c, 0x7d, 0x7e, 0x73, 0x77, 0x74, 0x79, 0x35, 0x30].contains(event.keyCode) {
@@ -1708,20 +1699,11 @@ final class InputTypeController: IMKInputController {
                     let prefixItems = currentPresentedCandidates
                         .filter(\.isDirectCommit)
                         .map { RimeCandidateItem(text: $0.text, comment: $0.comment) }
-                    var built = CandidatePipeline.buildCandidates(
+                    let built = CandidatePipeline.buildCandidates(
                         rimeCandidates: expanded,
                         directPrefixItems: prefixItems,
                         syllableCount: sylCount
                     )
-                    if InputSettings.shared.personalRankingEnabled {
-                        let code = UserRankingEngine.normalizeCode(currentPreedit)
-                        let bundleID = currentClient?.bundleIdentifier()
-                        built = UserRankingEngine.shared.rerank(
-                            candidates: built,
-                            code: code,
-                            emitBoostForWord: { EmitHistory.shared.entityMatchBoost(for: $0, bundleID: bundleID) }
-                        )
-                    }
                     currentPresentedCandidates = built
                     currentCandidates = built.map { RimeCandidateItem(text: $0.text, comment: $0.comment) }
                     candidatePresenter.presentSync(preedit: currentPreedit, candidates: built)
@@ -2019,38 +2001,18 @@ final class InputTypeController: IMKInputController {
 
     private func deleteHighlightedCandidate(withText text: String, client: (any IMKTextInput)?) {
         guard !text.isEmpty else { return }
-        let code = UserRankingEngine.normalizeCode(currentPreedit)
         if let presented = currentPresentedCandidates.first(where: { $0.text == text }),
            let rimeIdx = presented.originalRimeIndex {
             _ = RimeEngine.shared.deleteCandidate(sessionId: sessionId, index: rimeIdx)
         } else if let fallbackIdx = currentRimeCandidates.firstIndex(where: { $0.text == text }) {
             _ = RimeEngine.shared.deleteCandidate(sessionId: sessionId, index: fallbackIdx)
         }
-        if !code.isEmpty {
-            UserRankingEngine.shared.blacklist(code: code, word: text)
-        }
         syncRimeState(client: client)
     }
 
     private func commitCandidate(withText text: String, client: (any IMKTextInput)?) {
         queryCoordinator.cancelAll()
-        let matchedPresented = currentPresentedCandidates.first(where: { $0.text == text })
         if asciiComposingBuffer != nil || currentDirectCommitTexts.contains(text) {
-            if asciiComposingBuffer == nil,
-               InputSettings.shared.personalRankingEnabled,
-               let presented = matchedPresented,
-               presented.isWholeSentence {
-                let learnCode = presented.repairedCode ?? UserRankingEngine.normalizeCode(currentPreedit)
-                let displayedRank = currentPresentedCandidates.firstIndex(where: { $0.text == text }) ?? 0
-                if !learnCode.isEmpty {
-                    UserRankingEngine.shared.recordSelection(
-                        code: learnCode,
-                        word: text,
-                        rank: displayedRank,
-                        isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
-                    )
-                }
-            }
             asciiComposingBuffer = nil
             RimeEngine.shared.clearComposition(sessionId: sessionId)
             currentPreedit = ""
@@ -2068,12 +2030,6 @@ final class InputTypeController: IMKInputController {
             return
         }
 
-        let codeBeforeCommit = UserRankingEngine.normalizeCode(currentPreedit)
-        let displayedRank = currentPresentedCandidates.firstIndex(where: { $0.text == text }) ?? 0
-        let skippedTopWords: [String] = displayedRank > 0
-            ? Array(currentPresentedCandidates.prefix(min(displayedRank, 3)).map(\.text))
-            : []
-
         // Always map displayed candidate back to its exact original Rime index so userdb & segmented commits stay intact
         let index: Int
         if let presented = currentPresentedCandidates.first(where: { $0.text == text }),
@@ -2081,16 +2037,6 @@ final class InputTypeController: IMKInputController {
             index = originalIdx
         } else {
             index = currentRimeCandidates.firstIndex(where: { $0.text == text }) ?? 0
-        }
-
-        if InputSettings.shared.personalRankingEnabled && !codeBeforeCommit.isEmpty {
-            UserRankingEngine.shared.recordSelection(
-                code: codeBeforeCommit,
-                word: text,
-                rank: displayedRank,
-                skippedTopWords: skippedTopWords,
-                isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
-            )
         }
 
         if RimeEngine.shared.selectCandidate(sessionId: sessionId, index: index) {
@@ -2790,89 +2736,11 @@ final class InputTypeController: IMKInputController {
 
             currentDirectCommitTexts = directTexts
 
-            var presented = CandidatePipeline.buildCandidates(
+            let presented = CandidatePipeline.buildCandidates(
                 rimeCandidates: rimeCandidates,
                 directPrefixItems: extraItems,
                 syllableCount: syllableCount
             )
-
-            // Plan A Pillar 2: QWERTY physical-distance Pinyin Augmenter (zero cost on clean pinyin & pure简拼)
-            let rawInputForAugment = (context.selStart == 0) ? (RimeEngine.shared.getRawInput(sessionId: sessionId) ?? "") : ""
-            let rawCaretForAugment = (context.selStart == 0 && !rawInputForAugment.isEmpty)
-                ? RimeEngine.shared.getCaretPos(sessionId: sessionId)
-                : 0
-            if InputSettings.shared.typoCorrectionEnabled,
-               context.selStart == 0,
-               !rawInputForAugment.isEmpty,
-               rawCaretForAugment == rawInputForAugment.utf8.count {
-                let diag = PinyinTypoAugmenter.diagnose(rawInput: rawInputForAugment, preedit: context.preedit)
-                if diag != .none {
-                    let repairs = PinyinTypoAugmenter.generateRepairs(
-                        rawInput: rawInputForAugment,
-                        diagnosis: diag,
-                        originalSegmentCount: syllableCount,
-                        maxCandidates: 3
-                    )
-                    if !repairs.isEmpty {
-                        let queried = RimeEngine.shared.queryRepairedCandidates(
-                            sessionId: sessionId,
-                            rawInputToRestore: rawInputForAugment,
-                            caretToRestore: rawCaretForAugment,
-                            repairedInputs: repairs.map(\.pinyin)
-                        )
-                        var existingKeys = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
-                        var repairedCands: [PresentedCandidate] = []
-                        for (idx, item) in queried.enumerated() {
-                            let key = CandidatePipeline.dedupeKey(for: item.text)
-                            guard !key.isEmpty, !existingKeys.contains(key) else { continue }
-                            existingKeys.insert(key)
-                            currentDirectCommitTexts.insert(item.text)
-                            repairedCands.append(
-                                PresentedCandidate(
-                                    text: item.text,
-                                    comment: nil,
-                                    originalRimeIndex: nil,
-                                    isDirectCommit: true,
-                                    isWholeSentence: true,
-                                    baseRank: idx,
-                                    repairedCode: item.repairedInput
-                                )
-                            )
-                        }
-                        if !repairedCands.isEmpty {
-                            // Insert repaired whole sentences right after any direct custom phrases
-                            let insertPos = presented.firstIndex(where: { !($0.isDirectCommit && !$0.isWholeSentence) }) ?? presented.count
-                            switch diag {
-                            case .broken:
-                                presented.insert(contentsOf: repairedCands, at: insertPos)
-                            case .trailingInitial:
-                                let rimeTopLen = presented.dropFirst(insertPos).first?.text.count ?? 0
-                                let targetPos = (syllableCount >= 4 || rimeTopLen < syllableCount)
-                                    ? insertPos
-                                    : min(insertPos + 1, presented.count)
-                                presented.insert(contentsOf: repairedCands, at: targetPos)
-                            case .suspicious:
-                                // `.suspicious`: promote ahead of fragmented Rime output when repaired is cleaner/shorter
-                                let rimeTopLen = presented.dropFirst(insertPos).first?.text.count ?? Int.max
-                                let repairLen = repairedCands[0].text.count
-                                let targetPos = (repairLen < rimeTopLen) ? insertPos : min(insertPos + 1, presented.count)
-                                presented.insert(contentsOf: repairedCands, at: targetPos)
-                            case .none:
-                                break
-                            }
-                        }
-                    }
-                }
-            }
-
-            let bundleID = client?.bundleIdentifier()
-            if InputSettings.shared.personalRankingEnabled {
-                presented = UserRankingEngine.shared.rerank(
-                    candidates: presented,
-                    code: normalizedQuery,
-                    emitBoostForWord: { EmitHistory.shared.entityMatchBoost(for: $0, bundleID: bundleID) }
-                )
-            }
             let tier1Ms = (CFAbsoluteTimeGetCurrent() - tier1Start) * 1000.0
 
             currentPresentedCandidates = presented
@@ -2915,41 +2783,41 @@ final class InputTypeController: IMKInputController {
                 )
             }
 
-            // Plan A Pillar 3 + Tier 2:
-            // After 45ms debounce, branch Rime's top alternate prefixes into genuine N-best whole-sentence beams
-            // (breaking Rime Poet's 1-sentence limit) and feed them to LocalNeuralReranker when enabled.
-            let contextPrefix = InputSettings.shared.personalRankingEnabled
-                ? EmitHistory.shared.recentContext(forBundleID: bundleID, maxChars: 80)
-                : ""
-            let wholeSentenceCount = presented.prefix(8).filter(\.isWholeSentence).count
-            let canExpandNBest = (context.selStart == 0)
-                && !rawInputForAugment.isEmpty
-                && rawCaretForAugment == rawInputForAugment.utf8.count
-                && syllableCount >= 3
-                && wholeSentenceCount < 4
-            let neuralPotentiallyEligible = LocalNeuralReranker.shared.isInstalled
-                && InputSettings.shared.localRerankerEnabled
-                && (syllableCount >= 6 || (syllableCount >= 2 && !contextPrefix.isEmpty))
+            // Optional Tier-2 local neural reranker (only runs when explicitly installed & enabled in Settings)
+            if LocalNeuralReranker.shared.isInstalled && InputSettings.shared.localRerankerEnabled {
+                let bundleID = client?.bundleIdentifier()
+                let contextPrefix = EmitHistory.shared.recentContext(forBundleID: bundleID, maxChars: 80)
+                let rawInputForExpand = (context.selStart == 0) ? (RimeEngine.shared.getRawInput(sessionId: sessionId) ?? "") : ""
+                let rawCaretForExpand = (context.selStart == 0 && !rawInputForExpand.isEmpty)
+                    ? RimeEngine.shared.getCaretPos(sessionId: sessionId)
+                    : 0
+                let wholeSentenceCount = presented.prefix(8).filter(\.isWholeSentence).count
+                let canExpandNBest = (context.selStart == 0)
+                    && !rawInputForExpand.isEmpty
+                    && rawCaretForExpand == rawInputForExpand.utf8.count
+                    && syllableCount >= 3
+                    && wholeSentenceCount < 4
+                let neuralPotentiallyEligible = (syllableCount >= 6 || (syllableCount >= 2 && !contextPrefix.isEmpty))
 
-            if canExpandNBest || LocalNeuralReranker.shared.shouldTrigger(
-                syllableCount: syllableCount,
-                candidates: presented,
-                contextPrefix: contextPrefix
-            ) {
-                let snapshotPreedit = context.preedit
-                let snapshotCandidates = presented
-                let snapshotCode = normalizedQuery
-                let snapshotRawInput = rawInputForAugment
-                let snapshotCaret = rawCaretForAugment
-                let shouldExpand = canExpandNBest && (neuralPotentiallyEligible || (syllableCount >= 4 && wholeSentenceCount <= 1))
+                if canExpandNBest || LocalNeuralReranker.shared.shouldTrigger(
+                    syllableCount: syllableCount,
+                    candidates: presented,
+                    contextPrefix: contextPrefix
+                ) {
+                    let snapshotPreedit = context.preedit
+                    let snapshotCandidates = presented
+                    let snapshotCode = normalizedQuery
+                    let snapshotRawInput = rawInputForExpand
+                    let snapshotCaret = rawCaretForExpand
+                    let shouldExpand = canExpandNBest && neuralPotentiallyEligible
 
-                if shouldExpand || neuralPotentiallyEligible {
-                    queryCoordinator.schedule(
-                        work: { [weak self] () async -> NeuralRerankResult? in
-                            var workingCandidates = snapshotCandidates
-                            var newlyExpandedTexts: [String] = []
+                    if shouldExpand || neuralPotentiallyEligible {
+                        queryCoordinator.schedule(
+                            work: { [weak self] () async -> NeuralRerankResult? in
+                                var workingCandidates = snapshotCandidates
+                                var newlyExpandedTexts: [String] = []
 
-                            if shouldExpand {
+                                if shouldExpand {
                                 let expanded: [String] = await MainActor.run {
                                     guard let self,
                                           self.currentPreedit == snapshotPreedit,
@@ -3044,6 +2912,7 @@ final class InputTypeController: IMKInputController {
                             }
                         }
                     )
+                    }
                 }
             }
         }

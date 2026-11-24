@@ -308,17 +308,11 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
     try? FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
 
     let sharedDir = RimeEngine.shared.sharedDataDir(for: presetArg)
-    // Write isolated custom YAML with Plan A typo correction + grammar (if installed)
+    // Write isolated custom YAML matching production clean Rime + grammar config
     let customURL = tmpRoot.appendingPathComponent("\(presetArg.schemaID).custom.yaml")
     var customLines = [
         "patch:",
-        "  translator/enable_word_completion: true",
-        "  speller/algebra/+:",
-        "    - derive/([aoei])ng$/$1gn/",
-        "    - derive/([aoei])ng$/$1mg/",
-        "    - derive/ian$/ina/",
-        "    - derive/uan$/una/",
-        "    - derive/^([bpmfdtnlgkhjqxzcsw])/$1$1/"
+        "  translator/enable_word_completion: true"
     ]
     if presetArg == .wanxiang {
         customLines.append("  super_processor/enable_backspace_limit: false")
@@ -350,13 +344,25 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
             "    - simplifier@emoji",
             "    - lua_filter@*wanxiang.super_english*F",
             "    - lua_filter@*wanxiang.super_filter",
-            "    - uniquifier"
+            "    - uniquifier",
+            "  speller/algebra/+:",
+            "    - abbrev/^er$/e/"
+        ])
+    } else {
+        customLines.append(contentsOf: [
+            "  speller/algebra/+:",
+            "    - derive/([aoei])ng$/$1gn/",
+            "    - derive/([aoei])ng$/$1mg/",
+            "    - derive/ian$/ina/",
+            "    - derive/uan$/una/"
         ])
     }
     GrammarModelManager.shared.ensureSymlinks(in: tmpRoot.path)
     if let gramLang = GrammarModelManager.shared.activeGrammarLanguage(preferred: .lightweight, enabled: true) {
         customLines.append("  grammar/language: \(gramLang)")
-        customLines.append("  translator/contextual_suggestions: true")
+        if presetArg != .wanxiang {
+            customLines.append("  translator/contextual_suggestions: true")
+        }
     }
     try? (customLines.joined(separator: "\n") + "\n").write(to: customURL, atomically: true, encoding: .utf8)
 
@@ -395,56 +401,7 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
         let syl = CandidatePipeline.syllableCount(from: ctx?.preedit ?? pinyin)
         let limit = CandidatePipeline.adaptiveFetchLimit(syllableCount: syl, isExpanded: false)
         let raw = RimeEngine.shared.getAllCandidates(sessionId: session, limit: limit)
-        var presented = CandidatePipeline.buildCandidates(rimeCandidates: raw, directPrefixItems: [], syllableCount: syl)
-        if let ctx, ctx.selStart == 0 {
-            let diag = PinyinTypoAugmenter.diagnose(rawInput: pinyin, preedit: ctx.preedit)
-            if diag != .none {
-                let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: pinyin, diagnosis: diag, originalSegmentCount: syl, maxCandidates: 3)
-                if !repairs.isEmpty {
-                    let queried = RimeEngine.shared.queryRepairedCandidates(
-                        sessionId: session,
-                        rawInputToRestore: pinyin,
-                        caretToRestore: pinyin.utf8.count,
-                        repairedInputs: repairs.map(\.pinyin)
-                    )
-                    var existing = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
-                    var repairedCands: [PresentedCandidate] = []
-                    for (idx, item) in queried.enumerated() {
-                        let key = CandidatePipeline.dedupeKey(for: item.text)
-                        guard !key.isEmpty, !existing.contains(key) else { continue }
-                        existing.insert(key)
-                        repairedCands.append(
-                            PresentedCandidate(
-                                text: item.text,
-                                comment: nil,
-                                originalRimeIndex: nil,
-                                isDirectCommit: true,
-                                isWholeSentence: true,
-                                baseRank: idx,
-                                repairedCode: item.repairedInput
-                            )
-                        )
-                    }
-                    if !repairedCands.isEmpty {
-                        switch diag {
-                        case .broken:
-                            presented.insert(contentsOf: repairedCands, at: 0)
-                        case .trailingInitial:
-                            let rimeTopLen = presented.first?.text.count ?? 0
-                            let targetPos = (syl >= 4 || rimeTopLen < syl) ? 0 : min(1, presented.count)
-                            presented.insert(contentsOf: repairedCands, at: targetPos)
-                        case .suspicious:
-                            let targetPos = (repairedCands[0].text.count < (presented.first?.text.count ?? Int.max))
-                                ? 0
-                                : min(1, presented.count)
-                            presented.insert(contentsOf: repairedCands, at: targetPos)
-                        case .none:
-                            break
-                        }
-                    }
-                }
-            }
-        }
+        let presented = CandidatePipeline.buildCandidates(rimeCandidates: raw, directPrefixItems: [], syllableCount: syl)
 
         total += 1
         let isTop1 = presented.first?.text == expected

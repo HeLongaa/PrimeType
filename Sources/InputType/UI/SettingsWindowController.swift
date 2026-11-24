@@ -2259,33 +2259,11 @@ private struct AdvancedSettingsView: View {
                     )
                 }
 
-                Toggle(isOn: $settings.personalRankingEnabled) {
-                    SettingRowTitle(
-                        "个人反馈闭环与跨消息上下文",
-                        subtitle: "选中加权、上屏后 3 秒内删字强惩罚、30 天时间衰减与专词短时复现提权；组词时按 Shift+Delete 可永久移除误学词（当前已记录 \(rankingEntryCount) 条）"
-                    )
-                }
-
                 Toggle(isOn: $settings.typoCorrectionEnabled) {
                     SettingRowTitle(
                         "快打容错",
-                        subtitle: "自动容忍常见换位/邻键（如 zhognguo→中国）与双字母误连击（如 nihhao→你好），精确拼写始终优先"
+                        subtitle: "容忍常见韵母换位（如 zhognguo→中国），万象词库已内置完整容错规则"
                     )
-                }
-
-                if rankingEntryCount > 0 {
-                    HStack(alignment: .center) {
-                        SettingRowTitle(
-                            "清空个人反馈排序记录",
-                            subtitle: "仅重置本地反馈加权与黑名单，不影响 Rime 词库与用户词频"
-                        )
-                        Spacer()
-                        Button("重置反馈") {
-                            UserRankingEngine.shared.resetAll()
-                            rankingEntryCount = 0
-                            showStatus("已清空个人反馈排序记录", isError: false)
-                        }
-                    }
                 }
             } header: {
                 Text("智能输入行为")
