@@ -1,6 +1,6 @@
 import Cocoa
+import Combine
 import Darwin
-import SwiftUI
 
 private enum ClipboardFilterType: String, CaseIterable, Identifiable {
     case all = "所有类型"
@@ -22,61 +22,6 @@ private enum ClipboardFilterType: String, CaseIterable, Identifiable {
     }
 }
 
-private struct ClipboardActionPillGlassModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: Capsule())
-        } else {
-            content
-                .background(
-                    Capsule()
-                        .fill(.ultraThinMaterial)
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.primary.opacity(0.16), lineWidth: 0.75)
-                        )
-                )
-                .shadow(color: .black.opacity(0.16), radius: 8, y: 2)
-        }
-    }
-}
-
-private struct RowClickCatcher: NSViewRepresentable {
-    let onSingleClick: () -> Void
-    let onDoubleClick: () -> Void
-
-    func makeNSView(context: Context) -> ClickCatcherNSView {
-        let view = ClickCatcherNSView()
-        view.onSingleClick = onSingleClick
-        view.onDoubleClick = onDoubleClick
-        return view
-    }
-
-    func updateNSView(_ nsView: ClickCatcherNSView, context: Context) {
-        nsView.onSingleClick = onSingleClick
-        nsView.onDoubleClick = onDoubleClick
-    }
-
-    final class ClickCatcherNSView: NSView {
-        var onSingleClick: (() -> Void)?
-        var onDoubleClick: (() -> Void)?
-
-        override var mouseDownCanMoveWindow: Bool { false }
-
-        override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-            true
-        }
-
-        override func mouseDown(with event: NSEvent) {
-            if event.clickCount >= 2 {
-                onDoubleClick?()
-            } else {
-                onSingleClick?()
-            }
-        }
-    }
-}
-
 private enum ClipboardAppIconCache {
     private static var cache: [String: NSImage] = [:]
     private static let maxCachedIcons = 24
@@ -88,7 +33,6 @@ private enum ClipboardAppIconCache {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
             return nil
         }
-        // Downsample multi-resolution app icons (which include 512/1024px reps) to a lightweight 32x32 bitmap
         let rawIcon = NSWorkspace.shared.icon(forFile: url.path)
         let targetSize = NSSize(width: 32, height: 32)
         let small = NSImage(size: targetSize, flipped: false) { rect in
@@ -123,483 +67,698 @@ private final class ClipboardPanelState: ObservableObject {
     }
 }
 
-private struct ClipboardPopupView: View {
-    @ObservedObject var manager = ClipboardManager.shared
-    @ObservedObject var state: ClipboardPanelState
-    let onPaste: (ClipboardEntry) -> Void
-    let onDismiss: () -> Void
+// MARK: - Pure AppKit Clipboard Content View (Zero SwiftUI, < 6ms Popup)
 
-    @FocusState private var searchFocused: Bool
+private enum ClipboardListRowModel {
+    case section(String)
+    case entry(ClipboardEntry)
+}
 
-    private var filteredEntries: [ClipboardEntry] {
-        manager.entries.filter { entry in
-            guard state.filterType.matches(entry) else { return false }
-            let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !query.isEmpty else { return true }
-            if entry.listTitle.localizedCaseInsensitiveContains(query) { return true }
-            if let app = entry.sourceAppName, app.localizedCaseInsensitiveContains(query) { return true }
-            return false
-        }
+private final class ClipboardActionControlView: NSView {
+    var onClick: (() -> Void)?
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
+private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+    private let state: ClipboardPanelState
+    private let onPaste: (ClipboardEntry) -> Void
+    private let onDismiss: () -> Void
+    private var cancellables: Set<AnyCancellable> = []
+
+    private var rows: [ClipboardListRowModel] = []
+    private var filteredEntries: [ClipboardEntry] = []
+
+    // Top bar
+    private let backBtn = NSButton()
+    private let searchField = NSTextField()
+    private let filterBtn = NSButton()
+    private let topDivider = NSView()
+
+    // Left list
+    private let listScrollView = NSScrollView()
+    private let tableView = NSTableView()
+    private let emptyListLabel = NSTextField(labelWithString: "")
+    private let bottomLeftFilterBtn = ClipboardActionControlView()
+    private let splitDivider = NSView()
+
+    // Right detail
+    private let rightContainer = NSView()
+    private let previewImageView = NSImageView()
+    private let previewTextScroll = NSScrollView()
+    private let previewTextView = NSTextView()
+    private let metadataStack = NSView()
+    private let emptyDetailLabel = NSTextField(labelWithString: "选择左侧条目查看详情")
+    private let actionPillHost = NSView()
+    private let pasteActionBtn = ClipboardActionControlView()
+    private let pasteTitleLabel = NSTextField(labelWithString: "")
+    private let actionsMenuBtn = ClipboardActionControlView()
+
+    override var isFlipped: Bool { true }
+
+    init(
+        state: ClipboardPanelState,
+        onPaste: @escaping (ClipboardEntry) -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        self.state = state
+        self.onPaste = onPaste
+        self.onDismiss = onDismiss
+        super.init(frame: NSRect(x: 0, y: 0, width: 780, height: 500))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        setupSubviews()
+        bindState()
+        reloadData(scrollToSelection: false)
     }
 
-    private var groupedSections: [(title: String, items: [ClipboardEntry])] {
-        let order = ["今天", "昨天", "更早"]
-        var dict: [String: [ClipboardEntry]] = [:]
-        for item in filteredEntries {
-            dict[item.dateSectionTitle, default: []].append(item)
-        }
-        return order.compactMap { key in
-            guard let items = dict[key], !items.isEmpty else { return nil }
-            return (title: key, items: items)
-        }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 
-    private var selectedEntry: ClipboardEntry? {
+    func focusSearchField() {
+        window?.makeFirstResponder(searchField)
+    }
+
+    private func setupSubviews() {
+        // Top bar (height 54)
+        backBtn.isBordered = false
+        let chevCfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        backBtn.image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: nil)?.withSymbolConfiguration(chevCfg)
+        backBtn.contentTintColor = .secondaryLabelColor
+        backBtn.target = self
+        backBtn.action = #selector(onBackTapped)
+        addSubview(backBtn)
+
+        searchField.isBordered = false
+        searchField.drawsBackground = false
+        searchField.focusRingType = .none
+        searchField.font = .systemFont(ofSize: 19, weight: .regular)
+        searchField.placeholderString = "输入以筛选条目..."
+        searchField.delegate = self
+        addSubview(searchField)
+
+        filterBtn.isBordered = false
+        filterBtn.bezelStyle = .inline
+        filterBtn.target = self
+        filterBtn.action = #selector(onTopFilterTapped)
+        addSubview(filterBtn)
+
+        topDivider.wantsLayer = true
+        topDivider.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
+        addSubview(topDivider)
+
+        // Left list
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("clip"))
+        col.width = 285
+        tableView.addTableColumn(col)
+        tableView.headerView = nil
+        tableView.backgroundColor = .clear
+        tableView.selectionHighlightStyle = .none
+        tableView.intercellSpacing = NSSize(width: 0, height: 2)
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.target = self
+        tableView.action = #selector(onTableSingleClick)
+        tableView.doubleAction = #selector(onTableDoubleClick)
+
+        listScrollView.documentView = tableView
+        listScrollView.hasVerticalScroller = true
+        listScrollView.autohidesScrollers = true
+        listScrollView.drawsBackground = false
+        listScrollView.borderType = .noBorder
+        listScrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 54, right: 0)
+        addSubview(listScrollView)
+
+        emptyListLabel.font = .systemFont(ofSize: 13)
+        emptyListLabel.textColor = .secondaryLabelColor
+        emptyListLabel.alignment = .center
+        emptyListLabel.isHidden = true
+        addSubview(emptyListLabel)
+
+        // Bottom-left floating glass circle button
+        bottomLeftFilterBtn.wantsLayer = true
+        bottomLeftFilterBtn.layer?.cornerRadius = 17
+        bottomLeftFilterBtn.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.75).cgColor
+        bottomLeftFilterBtn.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.18).cgColor
+        bottomLeftFilterBtn.layer?.borderWidth = 0.75
+        bottomLeftFilterBtn.onClick = { [weak self] in self?.showFilterMenu() }
+        let line1 = NSView(frame: NSRect(x: 10.5, y: 13.5, width: 13, height: 1.5))
+        line1.wantsLayer = true
+        line1.layer?.cornerRadius = 0.75
+        line1.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.85).cgColor
+        let line2 = NSView(frame: NSRect(x: 10.5, y: 19, width: 13, height: 1.5))
+        line2.wantsLayer = true
+        line2.layer?.cornerRadius = 0.75
+        line2.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.85).cgColor
+        bottomLeftFilterBtn.addSubview(line1)
+        bottomLeftFilterBtn.addSubview(line2)
+        addSubview(bottomLeftFilterBtn)
+
+        splitDivider.wantsLayer = true
+        splitDivider.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
+        addSubview(splitDivider)
+
+        // Right detail container
+        addSubview(rightContainer)
+
+        previewImageView.imageScaling = .scaleProportionallyDown
+        previewImageView.wantsLayer = true
+        previewImageView.layer?.cornerCurve = .continuous
+        previewImageView.layer?.cornerRadius = 10
+        previewImageView.layer?.masksToBounds = true
+        rightContainer.addSubview(previewImageView)
+
+        previewTextScroll.hasVerticalScroller = true
+        previewTextScroll.autohidesScrollers = true
+        previewTextScroll.drawsBackground = false
+        previewTextScroll.borderType = .noBorder
+        previewTextScroll.wantsLayer = true
+        previewTextScroll.layer?.cornerCurve = .continuous
+        previewTextScroll.layer?.cornerRadius = 10
+        previewTextScroll.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+
+        previewTextView.isEditable = false
+        previewTextView.isSelectable = true
+        previewTextView.drawsBackground = false
+        previewTextView.font = .systemFont(ofSize: 14)
+        previewTextView.textColor = .labelColor
+        previewTextView.textContainerInset = NSSize(width: 14, height: 14)
+        previewTextView.isVerticallyResizable = true
+        previewTextView.isHorizontallyResizable = false
+        previewTextView.textContainer?.widthTracksTextView = true
+        previewTextScroll.documentView = previewTextView
+        rightContainer.addSubview(previewTextScroll)
+
+        rightContainer.addSubview(metadataStack)
+
+        emptyDetailLabel.font = .systemFont(ofSize: 13)
+        emptyDetailLabel.textColor = .tertiaryLabelColor
+        emptyDetailLabel.alignment = .center
+        rightContainer.addSubview(emptyDetailLabel)
+
+        // Floating bottom-right action pill
+        actionPillHost.wantsLayer = true
+        actionPillHost.layer?.cornerRadius = 17
+        actionPillHost.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.78).cgColor
+        actionPillHost.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.16).cgColor
+        actionPillHost.layer?.borderWidth = 0.75
+
+        pasteActionBtn.onClick = { [weak self] in
+            if let entry = self?.selectedEntry() {
+                self?.onPaste(entry)
+            }
+        }
+        pasteTitleLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        pasteTitleLabel.textColor = .labelColor
+        pasteActionBtn.addSubview(pasteTitleLabel)
+        actionPillHost.addSubview(pasteActionBtn)
+
+        actionsMenuBtn.onClick = { [weak self] in
+            if let entry = self?.selectedEntry() {
+                self?.showActionsMenu(for: entry)
+            }
+        }
+        actionPillHost.addSubview(actionsMenuBtn)
+        rightContainer.addSubview(actionPillHost)
+    }
+
+    private func bindState() {
+        ClipboardManager.shared.$entries
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reloadData(scrollToSelection: false) }
+            .store(in: &cancellables)
+
+        state.$filterType
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reloadData(scrollToSelection: false) }
+            .store(in: &cancellables)
+
+        state.$searchText
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] text in
+                guard let self else { return }
+                if self.searchField.stringValue != text {
+                    self.searchField.stringValue = text
+                }
+                self.reloadData(scrollToSelection: false)
+            }
+            .store(in: &cancellables)
+
+        state.$selectedEntryID
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.tableView.reloadData()
+                self?.refreshDetail()
+            }
+            .store(in: &cancellables)
+
+        state.$keyboardScrollTick
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.scrollToSelectedEntry() }
+            .store(in: &cancellables)
+
+        state.$targetAppName
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshActionPill() }
+            .store(in: &cancellables)
+    }
+
+    private func selectedEntry() -> ClipboardEntry? {
         if let id = state.selectedEntryID, let match = filteredEntries.first(where: { $0.id == id }) {
             return match
         }
         return filteredEntries.first
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            Divider().opacity(0.25)
-            mainSplitContent
+    private func reloadData(scrollToSelection: Bool) {
+        let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        filteredEntries = ClipboardManager.shared.entries.filter { entry in
+            guard state.filterType.matches(entry) else { return false }
+            guard !query.isEmpty else { return true }
+            if entry.listTitle.localizedCaseInsensitiveContains(query) { return true }
+            if let app = entry.sourceAppName, app.localizedCaseInsensitiveContains(query) { return true }
+            return false
         }
-        .frame(width: 780, height: 500)
-        .onAppear {
-            searchFocused = true
-            if state.selectedEntryID == nil {
-                state.selectedEntryID = filteredEntries.first?.id
+
+        if let cur = state.selectedEntryID, !filteredEntries.contains(where: { $0.id == cur }) {
+            state.selectedEntryID = filteredEntries.first?.id
+        } else if state.selectedEntryID == nil {
+            state.selectedEntryID = filteredEntries.first?.id
+        }
+
+        let order = ["今天", "昨天", "更早"]
+        var dict: [String: [ClipboardEntry]] = [:]
+        for item in filteredEntries {
+            dict[item.dateSectionTitle, default: []].append(item)
+        }
+        var built: [ClipboardListRowModel] = []
+        for title in order {
+            if let items = dict[title], !items.isEmpty {
+                built.append(.section(title))
+                for item in items {
+                    built.append(.entry(item))
+                }
             }
         }
-        .onChange(of: filteredEntries) { _, newItems in
-            if let current = state.selectedEntryID, newItems.contains(where: { $0.id == current }) {
-                return
-            }
-            state.selectedEntryID = newItems.first?.id
+        rows = built
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        filterBtn.attributedTitle = NSAttributedString(string: "≡ \(state.filterType.rawValue) ▾", attributes: attrs)
+
+        let isEmpty = filteredEntries.isEmpty
+        listScrollView.isHidden = isEmpty
+        emptyListLabel.isHidden = !isEmpty
+        emptyListLabel.stringValue = InputSettings.shared.clipboardEnabled ? "暂无剪贴板条目" : "剪贴板记录未开启"
+
+        tableView.reloadData()
+        if scrollToSelection { scrollToSelectedEntry() }
+        refreshDetail()
+        needsLayout = true
+    }
+
+    private func scrollToSelectedEntry() {
+        guard let targetID = state.selectedEntryID else { return }
+        if let rowIdx = rows.firstIndex(where: {
+            if case .entry(let e) = $0 { return e.id == targetID }
+            return false
+        }) {
+            tableView.scrollRowToVisible(rowIdx)
         }
     }
 
-    private var topBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                if !state.searchText.isEmpty {
-                    state.searchText = ""
-                } else {
-                    onDismiss()
-                }
-            } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.plain)
-
-            TextField("输入以筛选条目...", text: $state.searchText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 19, weight: .regular))
-                .focused($searchFocused)
-                .onSubmit {
-                    if let entry = selectedEntry {
-                        onPaste(entry)
-                    }
-                }
-
-            Spacer()
-
-            Menu {
-                ForEach(ClipboardFilterType.allCases) { type in
-                    Button {
-                        state.filterType = type
-                    } label: {
-                        HStack {
-                            Text(type.rawValue)
-                            if state.filterType == type {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "line.3.horizontal.decrease")
-                        .font(.system(size: 12))
-                    Text(state.filterType.rawValue)
-                        .font(.system(size: 13))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .foregroundStyle(.secondary)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+    private func refreshDetail() {
+        guard let entry = selectedEntry() else {
+            previewImageView.isHidden = true
+            previewTextScroll.isHidden = true
+            metadataStack.isHidden = true
+            actionPillHost.isHidden = true
+            emptyDetailLabel.isHidden = false
+            return
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-    }
 
-    private var mainSplitContent: some View {
-        HStack(spacing: 0) {
-            leftListColumn
-                .frame(width: 285)
-            Divider().opacity(0.25)
-            rightDetailColumn
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
+        emptyDetailLabel.isHidden = true
+        metadataStack.isHidden = false
+        actionPillHost.isHidden = false
 
-    private var leftListColumn: some View {
-        ZStack(alignment: .bottomLeading) {
-            if filteredEntries.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "doc.on.clipboard")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.tertiary)
-                    Text(InputSettings.shared.clipboardEnabled ? "暂无剪贴板条目" : "剪贴板记录未开启")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(groupedSections, id: \.title) { section in
-                                Text(section.title)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 14)
-                                    .padding(.top, 10)
-                                    .padding(.bottom, 2)
-
-                                ForEach(section.items) { entry in
-                                    entryRow(entry)
-                                        .id(entry.id)
-                                        .overlay {
-                                            RowClickCatcher(
-                                                onSingleClick: {
-                                                    state.selectedEntryID = entry.id
-                                                },
-                                                onDoubleClick: {
-                                                    state.selectedEntryID = entry.id
-                                                    onPaste(entry)
-                                                }
-                                            )
-                                        }
-                                }
-                            }
-                        }
-                        .padding(.bottom, 54)
-                    }
-                    .onChange(of: state.keyboardScrollTick) { _, _ in
-                        if let newId = state.selectedEntryID {
-                            withAnimation(.easeInOut(duration: 0.12)) {
-                                proxy.scrollTo(newId, anchor: .center)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Bottom-left quick filter / clear glass circle button (matching right action pill)
-            Button {
-                showFilterMenu()
-            } label: {
-                VStack(spacing: 3.5) {
-                    Capsule()
-                        .fill(Color.primary.opacity(0.85))
-                        .frame(width: 13, height: 1.5)
-                    Capsule()
-                        .fill(Color.primary.opacity(0.85))
-                        .frame(width: 13, height: 1.5)
-                }
-                .frame(width: 34, height: 34)
-                .background(
-                    Circle()
-                        .fill(.ultraThinMaterial)
-                        .overlay(
-                            Circle()
-                                .stroke(Color.primary.opacity(0.18), lineWidth: 0.75)
-                        )
-                )
-                .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
-                .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 14)
-            .padding(.bottom, 14)
-        }
-    }
-
-    private func entryRow(_ entry: ClipboardEntry) -> some View {
-        let isSelected = (selectedEntry?.id == entry.id)
-        return HStack(spacing: 10) {
-            if entry.kind == .image, let img = manager.thumbnailImage(for: entry) {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 24, height: 24)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
-                    )
-            } else {
-                Image(systemName: entry.kind.systemImage)
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(0.08))
-                    )
-            }
-
-            Text(entry.listTitle)
-                .font(.system(size: 13.5))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(.primary)
-
-            Spacer()
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? Color.primary.opacity(0.13) : Color.clear)
-        )
-        .padding(.horizontal, 8)
-        .contentShape(Rectangle())
-    }
-
-    private var rightDetailColumn: some View {
-        ZStack(alignment: .bottomTrailing) {
-            if let entry = selectedEntry {
-                VStack(alignment: .leading, spacing: 0) {
-                    previewArea(for: entry)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(.horizontal, 18)
-                        .padding(.top, 16)
-                        .padding(.bottom, 10)
-
-                    metadataArea(for: entry)
-                        .padding(.horizontal, 18)
-                        .padding(.bottom, 62)
-                }
-
-                bottomActionPill(for: entry)
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 14)
-            } else {
-                Text("选择左侧条目查看详情")
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func previewArea(for entry: ClipboardEntry) -> some View {
-        if entry.kind == .image, let img = manager.previewImage(for: entry) {
-            Image(nsImage: img)
-                .resizable()
-                .scaledToFit()
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .shadow(color: .black.opacity(0.18), radius: 8, y: 2)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        if entry.kind == .image, let img = ClipboardManager.shared.previewImage(for: entry) {
+            previewImageView.isHidden = false
+            previewImageView.image = img
+            previewTextScroll.isHidden = true
         } else {
-            ScrollView {
-                Text(entry.text ?? "")
-                    .font(.system(size: 14))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-            )
+            previewImageView.isHidden = true
+            previewImageView.image = nil
+            previewTextScroll.isHidden = false
+            previewTextView.string = entry.text ?? ""
+            previewTextView.scrollToBeginningOfDocument(nil)
         }
+
+        rebuildMetadata(for: entry)
+        refreshActionPill()
+        needsLayout = true
     }
 
-    private func metadataArea(for entry: ClipboardEntry) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("信息")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 6)
+    private func rebuildMetadata(for entry: ClipboardEntry) {
+        for sub in metadataStack.subviews { sub.removeFromSuperview() }
+        let w = max(200, rightContainer.bounds.width - 36)
+        var y: CGFloat = 0
 
-            if let appName = entry.sourceAppName {
-                metadataRow(label: "来源") {
-                    HStack(spacing: 6) {
-                        if let bid = entry.sourceAppBundleID,
-                           let icon = ClipboardAppIconCache.icon(forBundleID: bid) {
-                            Image(nsImage: icon)
-                                .resizable()
-                                .frame(width: 15, height: 15)
-                        }
-                        Text(appName)
-                    }
-                }
-            }
+        let header = NSTextField(labelWithString: "信息")
+        header.font = .systemFont(ofSize: 12, weight: .semibold)
+        header.textColor = .secondaryLabelColor
+        header.frame = NSRect(x: 0, y: y, width: w, height: 15)
+        metadataStack.addSubview(header)
+        y += 20
 
-            metadataRow(label: "种类") {
-                Text(entry.kind.displayName)
-            }
-
-            if entry.kind == .image, let w = entry.imageWidth, let h = entry.imageHeight {
-                metadataRow(label: "尺寸") {
-                    Text("\(w)×\(h)")
-                }
-            } else if let text = entry.text {
-                metadataRow(label: "字数") {
-                    Text("\(text.count) 字符")
-                }
-            }
-
-            metadataRow(label: "大小") {
-                Text(entry.formattedSize)
-            }
-
-            metadataRow(label: "拷贝时间", showDivider: false) {
-                Text(entry.formattedTimestamp)
-            }
+        var specs: [(label: String, value: String, icon: NSImage?)] = []
+        if let appName = entry.sourceAppName {
+            let icon = entry.sourceAppBundleID.flatMap { ClipboardAppIconCache.icon(forBundleID: $0) }
+            specs.append(("来源", appName, icon))
         }
-    }
+        specs.append(("种类", entry.kind.displayName, nil))
+        if entry.kind == .image, let iw = entry.imageWidth, let ih = entry.imageHeight {
+            specs.append(("尺寸", "\(iw)×\(ih)", nil))
+        } else if let text = entry.text {
+            specs.append(("字数", "\(text.count) 字符", nil))
+        }
+        specs.append(("大小", entry.formattedSize, nil))
+        specs.append(("拷贝时间", entry.formattedTimestamp, nil))
 
-    private func metadataRow<Content: View>(label: String, showDivider: Bool = true, @ViewBuilder value: () -> Content) -> some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(label)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                value()
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(.primary)
+        for (idx, row) in specs.enumerated() {
+            let rowH: CGFloat = 26
+            let keyLbl = NSTextField(labelWithString: row.label)
+            keyLbl.font = .systemFont(ofSize: 12.5)
+            keyLbl.textColor = .secondaryLabelColor
+            keyLbl.frame = NSRect(x: 0, y: y + 5, width: 70, height: 16)
+            metadataStack.addSubview(keyLbl)
+
+            let valLbl = NSTextField(labelWithString: row.value)
+            valLbl.font = .systemFont(ofSize: 12.5, weight: .medium)
+            valLbl.textColor = .labelColor
+            valLbl.alignment = .right
+            valLbl.lineBreakMode = .byTruncatingTail
+            let vw = min(w - 96, ceil(valLbl.fittingSize.width) + 2)
+            valLbl.frame = NSRect(x: w - vw, y: y + 5, width: vw, height: 16)
+            metadataStack.addSubview(valLbl)
+
+            if let icon = row.icon {
+                let iv = NSImageView(frame: NSRect(x: w - vw - 21, y: y + 5.5, width: 15, height: 15))
+                iv.image = icon
+                iv.imageScaling = .scaleProportionallyUpOrDown
+                metadataStack.addSubview(iv)
             }
-            .padding(.vertical, 6)
 
-            if showDivider {
-                Divider().opacity(0.18)
+            y += rowH
+            if idx < specs.count - 1 {
+                let div = NSView(frame: NSRect(x: 0, y: y, width: w, height: 1))
+                div.wantsLayer = true
+                div.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
+                metadataStack.addSubview(div)
+                y += 1
             }
         }
     }
 
-    private func bottomActionPill(for entry: ClipboardEntry) -> some View {
-        HStack(spacing: 12) {
-            Button {
+    private func refreshActionPill() {
+        for sub in pasteActionBtn.subviews where sub !== pasteTitleLabel { sub.removeFromSuperview() }
+        for sub in actionsMenuBtn.subviews { sub.removeFromSuperview() }
+        for sub in actionPillHost.subviews where sub !== pasteActionBtn && sub !== actionsMenuBtn { sub.removeFromSuperview() }
+
+        pasteTitleLabel.stringValue = "粘贴到 \(state.targetAppName)"
+        pasteTitleLabel.sizeToFit()
+        let pW = ceil(pasteTitleLabel.fittingSize.width)
+
+        let retBadge = makeKeyBadge("↵", tint: .labelColor)
+        let leftW = pW + 6 + retBadge.frame.width
+        pasteActionBtn.frame = NSRect(x: 14, y: 0, width: leftW, height: 34)
+        pasteTitleLabel.frame = NSRect(x: 0, y: 9, width: pW, height: 16)
+        retBadge.frame.origin = NSPoint(x: pW + 6, y: round((34 - retBadge.frame.height) * 0.5))
+        pasteActionBtn.addSubview(retBadge)
+
+        let divX = 14 + leftW + 12
+        let div = NSView(frame: NSRect(x: divX, y: 9, width: 1, height: 16))
+        div.wantsLayer = true
+        div.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
+        actionPillHost.addSubview(div)
+
+        let opsLbl = NSTextField(labelWithString: "操作")
+        opsLbl.font = .systemFont(ofSize: 13)
+        opsLbl.textColor = .secondaryLabelColor
+        opsLbl.sizeToFit()
+        let oW = ceil(opsLbl.fittingSize.width)
+        let cmdBadge = makeKeyBadge("⌘", tint: .secondaryLabelColor)
+        let kBadge = makeKeyBadge("K", tint: .secondaryLabelColor)
+        let rightW = oW + 5 + cmdBadge.frame.width + 4 + kBadge.frame.width
+
+        actionsMenuBtn.frame = NSRect(x: divX + 13, y: 0, width: rightW, height: 34)
+        opsLbl.frame = NSRect(x: 0, y: 9, width: oW, height: 16)
+        cmdBadge.frame.origin = NSPoint(x: oW + 5, y: round((34 - cmdBadge.frame.height) * 0.5))
+        kBadge.frame.origin = NSPoint(x: cmdBadge.frame.maxX + 4, y: round((34 - kBadge.frame.height) * 0.5))
+        actionsMenuBtn.addSubview(opsLbl)
+        actionsMenuBtn.addSubview(cmdBadge)
+        actionsMenuBtn.addSubview(kBadge)
+
+        let totalW = divX + 13 + rightW + 14
+        let rightWContainer = rightContainer.bounds.width > 0 ? rightContainer.bounds.width : (780 - 286)
+        let rightHContainer = rightContainer.bounds.height > 0 ? rightContainer.bounds.height : (500 - 55)
+        actionPillHost.frame = NSRect(x: rightWContainer - 16 - totalW, y: rightHContainer - 14 - 34, width: totalW, height: 34)
+    }
+
+    private func makeKeyBadge(_ key: String, tint: NSColor) -> NSView {
+        let lbl = NSTextField(labelWithString: key)
+        lbl.font = .systemFont(ofSize: 11, weight: .medium)
+        lbl.textColor = tint
+        lbl.alignment = .center
+        lbl.sizeToFit()
+        let w = ceil(lbl.fittingSize.width) + 10
+        let h = ceil(lbl.fittingSize.height) + 4
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        box.wantsLayer = true
+        box.layer?.cornerCurve = .continuous
+        box.layer?.cornerRadius = 4
+        box.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.26).cgColor
+        box.layer?.borderWidth = 0.75
+        lbl.frame = NSRect(x: 5, y: 2, width: ceil(lbl.fittingSize.width), height: ceil(lbl.fittingSize.height))
+        box.addSubview(lbl)
+        return box
+    }
+
+    override func layout() {
+        super.layout()
+        let w = bounds.width
+        let h = bounds.height
+        let topH: CGFloat = 54
+        let leftW: CGFloat = 285
+
+        // Top bar
+        backBtn.frame = NSRect(x: 18, y: 15, width: 24, height: 24)
+        let fSize = filterBtn.fittingSize
+        let fw = ceil(fSize.width) + 10
+        filterBtn.frame = NSRect(x: w - 18 - fw, y: 16, width: fw, height: 22)
+        searchField.frame = NSRect(x: 52, y: 14, width: max(100, filterBtn.frame.minX - 64), height: 26)
+        topDivider.frame = NSRect(x: 0, y: topH, width: w, height: 1)
+
+        // Split content
+        let bodyY = topH + 1
+        let bodyH = h - bodyY
+        listScrollView.frame = NSRect(x: 0, y: bodyY, width: leftW, height: bodyH)
+        tableView.tableColumns.first?.width = leftW
+        emptyListLabel.frame = NSRect(x: 16, y: bodyY + round((bodyH - 22) * 0.5), width: leftW - 32, height: 22)
+        bottomLeftFilterBtn.frame = NSRect(x: 14, y: h - 14 - 34, width: 34, height: 34)
+        splitDivider.frame = NSRect(x: leftW, y: bodyY, width: 1, height: bodyH)
+
+        // Right detail
+        let rx = leftW + 1
+        let rw = w - rx
+        rightContainer.frame = NSRect(x: rx, y: bodyY, width: rw, height: bodyH)
+        emptyDetailLabel.frame = NSRect(x: 20, y: round((bodyH - 22) * 0.5), width: rw - 40, height: 22)
+
+        let metaH: CGFloat = 158
+        let previewH = max(120, bodyH - 16 - 10 - metaH - 62)
+        let previewRect = NSRect(x: 18, y: 16, width: rw - 36, height: previewH)
+        previewImageView.frame = previewRect
+        previewTextScroll.frame = previewRect
+        previewTextView.frame = NSRect(x: 0, y: 0, width: previewRect.width, height: max(previewRect.height, previewTextView.frame.height))
+        metadataStack.frame = NSRect(x: 18, y: previewRect.maxY + 10, width: rw - 36, height: metaH)
+        if let entry = selectedEntry() {
+            rebuildMetadata(for: entry)
+        }
+        refreshActionPill()
+    }
+
+    // MARK: - NSTableViewDataSource & Delegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        switch rows[row] {
+        case .section: return 26
+        case .entry: return 40
+        }
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        switch rows[row] {
+        case .section(let title):
+            let cell = NSView(frame: NSRect(x: 0, y: 0, width: 285, height: 26))
+            let lbl = NSTextField(labelWithString: title)
+            lbl.font = .systemFont(ofSize: 12, weight: .medium)
+            lbl.textColor = .secondaryLabelColor
+            lbl.frame = NSRect(x: 14, y: 4, width: 257, height: 16)
+            cell.addSubview(lbl)
+            return cell
+
+        case .entry(let entry):
+            let isSelected = (selectedEntry()?.id == entry.id)
+            let cell = NSView(frame: NSRect(x: 0, y: 0, width: 285, height: 40))
+
+            let bg = NSView(frame: NSRect(x: 8, y: 1, width: 269, height: 38))
+            bg.wantsLayer = true
+            bg.layer?.cornerCurve = .continuous
+            bg.layer?.cornerRadius = 10
+            bg.layer?.backgroundColor = isSelected ? NSColor.labelColor.withAlphaComponent(0.13).cgColor : NSColor.clear.cgColor
+            cell.addSubview(bg)
+
+            let iconBox = NSView(frame: NSRect(x: 10, y: 7, width: 24, height: 24))
+            iconBox.wantsLayer = true
+            iconBox.layer?.cornerCurve = .continuous
+            iconBox.layer?.cornerRadius = 6
+            iconBox.layer?.masksToBounds = true
+
+            if entry.kind == .image, let thumb = ClipboardManager.shared.thumbnailImage(for: entry) {
+                let iv = NSImageView(frame: iconBox.bounds)
+                iv.image = thumb
+                iv.imageScaling = .scaleAxesIndependently
+                iconBox.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
+                iconBox.layer?.borderWidth = 0.5
+                iconBox.addSubview(iv)
+            } else {
+                iconBox.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.08).cgColor
+                let iv = NSImageView(frame: NSRect(x: 4, y: 4, width: 16, height: 16))
+                let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+                iv.image = NSImage(systemSymbolName: entry.kind.systemImage, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+                iv.contentTintColor = .secondaryLabelColor
+                iv.imageScaling = .scaleProportionallyDown
+                iconBox.addSubview(iv)
+            }
+            bg.addSubview(iconBox)
+
+            let lbl = NSTextField(labelWithString: entry.listTitle)
+            lbl.font = .systemFont(ofSize: 13.5)
+            lbl.textColor = .labelColor
+            lbl.lineBreakMode = .byTruncatingTail
+            lbl.frame = NSRect(x: 44, y: 11, width: 215, height: 17)
+            bg.addSubview(lbl)
+
+            return cell
+        }
+    }
+
+    @objc private func onTableSingleClick() {
+        let row = tableView.clickedRow
+        guard row >= 0 && row < rows.count else { return }
+        if case .entry(let entry) = rows[row] {
+            state.selectedEntryID = entry.id
+        }
+    }
+
+    @objc private func onTableDoubleClick() {
+        let row = tableView.clickedRow
+        guard row >= 0 && row < rows.count else { return }
+        if case .entry(let entry) = rows[row] {
+            state.selectedEntryID = entry.id
+            onPaste(entry)
+        }
+    }
+
+    // MARK: - Search & Menus
+
+    func controlTextDidChange(_ obj: Notification) {
+        state.searchText = searchField.stringValue
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            if let entry = selectedEntry() {
                 onPaste(entry)
-            } label: {
-                HStack(spacing: 6) {
-                    Text("粘贴到 \(state.targetAppName)")
-                        .font(.system(size: 13, weight: .medium))
-                    Text("↵")
-                        .font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .stroke(Color.primary.opacity(0.28), lineWidth: 0.75)
-                        )
-                }
-                .padding(.vertical, 6)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-
-            Divider()
-                .frame(height: 16)
-                .opacity(0.3)
-
-            Button {
-                showActionsMenu(for: entry)
-            } label: {
-                HStack(spacing: 5) {
-                    Text("操作")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                    Text("⌘")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .stroke(Color.primary.opacity(0.24), lineWidth: 0.75)
-                        )
-                    Text("K")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .stroke(Color.primary.opacity(0.24), lineWidth: 0.75)
-                        )
-                }
-                .padding(.vertical, 6)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+            return true
         }
-        .padding(.horizontal, 14)
-        .frame(height: 34)
-        .modifier(ClipboardActionPillGlassModifier())
+        return false
+    }
+
+    @objc private func onBackTapped() {
+        if !state.searchText.isEmpty {
+            state.searchText = ""
+            searchField.stringValue = ""
+        } else {
+            onDismiss()
+        }
+    }
+
+    @objc private func onTopFilterTapped() {
+        let menu = NSMenu()
+        for type in ClipboardFilterType.allCases {
+            let item = MenuActionItem(title: type.rawValue) { [weak self] in
+                self?.state.filterType = type
+            }
+            item.state = (state.filterType == type) ? .on : .off
+            menu.addItem(item)
+        }
+        let pt = NSPoint(x: 0, y: filterBtn.bounds.height + 4)
+        menu.popUp(positioning: nil, at: pt, in: filterBtn)
     }
 
     private func showFilterMenu() {
         let menu = NSMenu()
         for type in ClipboardFilterType.allCases {
-            let item = MenuActionItem(title: type.rawValue) {
-                state.filterType = type
+            let item = MenuActionItem(title: type.rawValue) { [weak self] in
+                self?.state.filterType = type
             }
             item.state = (state.filterType == type) ? .on : .off
             menu.addItem(item)
         }
         menu.addItem(.separator())
         menu.addItem(MenuActionItem(title: "清空全部剪贴板记录") {
-            manager.clearAll()
+            ClipboardManager.shared.clearAll()
         })
         popUpMenuInsidePanel(menu, alignRight: false)
     }
 
     private func showActionsMenu(for entry: ClipboardEntry) {
         let menu = NSMenu()
-        menu.addItem(MenuActionItem(title: "粘贴到 \(state.targetAppName)") {
-            onPaste(entry)
+        menu.addItem(MenuActionItem(title: "粘贴到 \(state.targetAppName)") { [weak self] in
+            self?.onPaste(entry)
         })
-        menu.addItem(MenuActionItem(title: "仅复制到剪贴板") {
-            manager.copyToPasteboard(entry)
-            onDismiss()
+        menu.addItem(MenuActionItem(title: "仅复制到剪贴板") { [weak self] in
+            ClipboardManager.shared.copyToPasteboard(entry)
+            self?.onDismiss()
         })
         menu.addItem(.separator())
         menu.addItem(MenuActionItem(title: "删除此条目") {
-            manager.remove(id: entry.id)
+            ClipboardManager.shared.remove(id: entry.id)
         })
         menu.addItem(MenuActionItem(title: "清空全部记录") {
-            manager.clearAll()
+            ClipboardManager.shared.clearAll()
         })
         popUpMenuInsidePanel(menu, alignRight: true)
     }
 
     private func popUpMenuInsidePanel(_ menu: NSMenu, alignRight: Bool) {
-        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) else {
-            return
-        }
+        guard let window = self.window else { return }
         menu.update()
         let menuSize = menu.size
         let panelFrame = window.frame
         let x: CGFloat = alignRight
             ? max(panelFrame.minX + 14, panelFrame.maxX - menuSize.width - 16)
             : (panelFrame.minX + 14)
-        // NSMenu expands downward from `at`, so place top edge at buttonTop + menuHeight
-        // so the entire menu sits upward and strictly inside the clipboard panel.
         let topY = min(panelFrame.maxY - 14, panelFrame.minY + 56 + menuSize.height)
         menu.popUp(positioning: nil, at: NSPoint(x: x, y: topY), in: nil)
     }
@@ -884,6 +1043,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
     private let panel: FloatingClipboardPanel
     private let guideOverlay = ClipboardGuideOverlayWindow()
     private let state = ClipboardPanelState()
+    private weak var activeContentNSView: ClipboardContentNSView?
     private var previousApp: NSRunningApplication?
     private var keyMonitor: Any?
 
@@ -931,7 +1091,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
 
     private func attachContentViewIfNeeded() {
         guard panel.contentView == nil else { return }
-        let rootView = ClipboardPopupView(
+        let contentView = ClipboardContentNSView(
             state: state,
             onPaste: { [weak self] entry in
                 self?.pasteAndDismiss(entry)
@@ -940,13 +1100,11 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
                 self?.hide(restoreFocus: true)
             }
         )
-        let host = NSHostingView(rootView: rootView)
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
-        host.layer?.cornerCurve = .continuous
-        host.layer?.cornerRadius = 20
-        host.layer?.masksToBounds = true
-        host.autoresizingMask = [.width, .height]
+        contentView.layer?.cornerCurve = .continuous
+        contentView.layer?.cornerRadius = 20
+        contentView.layer?.masksToBounds = true
+        contentView.autoresizingMask = [.width, .height]
+        self.activeContentNSView = contentView
 
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
@@ -957,7 +1115,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             glass.layer?.cornerCurve = .continuous
             glass.layer?.cornerRadius = 20
             glass.layer?.masksToBounds = true
-            glass.contentView = host
+            glass.contentView = contentView
             panel.contentView = glass
         } else {
             let effect = NSVisualEffectView()
@@ -968,13 +1126,13 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             effect.layer?.masksToBounds = true
             effect.layer?.cornerCurve = .continuous
             effect.layer?.cornerRadius = 20
-            host.translatesAutoresizingMaskIntoConstraints = false
-            effect.addSubview(host)
+            contentView.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(contentView)
             NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-                host.topAnchor.constraint(equalTo: effect.topAnchor),
-                host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+                contentView.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                contentView.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                contentView.topAnchor.constraint(equalTo: effect.topAnchor),
+                contentView.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
             ])
             panel.contentView = effect
         }
@@ -1006,6 +1164,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         panel.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKey()
+        activeContentNSView?.focusSearchField()
         installKeyMonitor()
 
         DispatchQueue.main.async {

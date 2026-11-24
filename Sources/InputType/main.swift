@@ -284,6 +284,36 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
     ]
     if presetArg == .wanxiang {
         customLines.append("  super_processor/enable_backspace_limit: false")
+        customLines.append(contentsOf: [
+            "  engine/processors:",
+            "    - lua_processor@*wanxiang.super_processor",
+            "    - lua_processor@*wanxiang.super_english*P",
+            "    - ascii_composer",
+            "    - recognizer",
+            "    - key_binder",
+            "    - speller",
+            "    - punctuator",
+            "    - selector",
+            "    - navigator",
+            "    - express_editor",
+            "  engine/translators:",
+            "    - punct_translator",
+            "    - script_translator",
+            "    - lua_translator@*wanxiang.shijian",
+            "    - lua_translator@*wanxiang.number_conversion",
+            "    - lua_translator@*wanxiang.super_calculator",
+            "    - lua_translator@*wanxiang.super_english*T",
+            "    - table_translator@wanxiang_mixedcode",
+            "  engine/filters:",
+            "    - lua_filter@*wanxiang.charset_filter",
+            "    - lua_filter@*wanxiang.custom_phrase",
+            "    - lua_filter@*wanxiang.super_comment_preedit",
+            "    - simplifier@s2t",
+            "    - simplifier@emoji",
+            "    - lua_filter@*wanxiang.super_english*F",
+            "    - lua_filter@*wanxiang.super_filter",
+            "    - uniquifier"
+        ])
     }
     GrammarModelManager.shared.ensureSymlinks(in: tmpRoot.path)
     if let gramLang = GrammarModelManager.shared.activeGrammarLanguage(preferred: .lightweight, enabled: true) {
@@ -378,18 +408,23 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
         groupStats[group] = gs
     }
 
+    let footprintBeforeTrimMB = MemoryPressureManager.currentFootprintMB()
+    malloc_zone_pressure_relief(nil, 0)
+    let footprintAfterTrimMB = MemoryPressureManager.currentFootprintMB()
+
     RimeEngine.shared.destroySession(session)
     RimeEngine.shared.shutdown()
 
     let sortedLat = keyLatenciesMs.sorted()
     let p50 = sortedLat.isEmpty ? 0 : sortedLat[min(sortedLat.count - 1, Int(Double(sortedLat.count) * 0.50))]
     let p99 = sortedLat.isEmpty ? 0 : sortedLat[min(sortedLat.count - 1, Int(Double(sortedLat.count) * 0.99))]
-    print(String(format: "BENCH_SUMMARY preset=%@ total=%d top1=%.1f%% (%d/%d) top5=%.1f%% (%d/%d) keystroke_p50=%.2fms keystroke_p99=%.2fms",
+    print(String(format: "BENCH_SUMMARY preset=%@ total=%d top1=%.1f%% (%d/%d) top5=%.1f%% (%d/%d) keystroke_p50=%.2fms keystroke_p99=%.2fms phys_footprint=%.1fMB->%.1fMB",
                  presetArg.rawValue,
                  total,
                  total > 0 ? Double(top1Hits) * 100.0 / Double(total) : 0, top1Hits, total,
                  total > 0 ? Double(top5Hits) * 100.0 / Double(total) : 0, top5Hits, total,
-                 p50, p99))
+                 p50, p99,
+                 footprintBeforeTrimMB, footprintAfterTrimMB))
     for group in groupStats.keys.sorted() {
         let gs = groupStats[group]!
         print(String(format: "  group=%-8@ total=%2d top1=%5.1f%% (%d/%d) top5=%5.1f%% (%d/%d)",
@@ -443,9 +478,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if SettingsWindowController.shared.isOpen {
-            SettingsWindowController.shared.show()
-        }
         return false
     }
 }
@@ -513,13 +545,14 @@ HotKeyManager.shared.start {
     ClipboardPanelController.shared.toggle()
 }
 let launchOnboarding = CommandLine.arguments.contains("--onboarding")
+SettingsHelperLauncher.shared.startIPCListener()
 VoiceInputManager.shared.startMonitors()
 TranslateManager.shared.startMonitors()
 DispatchQueue.main.asyncAfter(deadline: .now() + (launchOnboarding ? 0.2 : 0.8)) {
     if launchOnboarding {
-        OnboardingWindowController.shared.show(openSettingsOnFinish: true)
+        SettingsHelperLauncher.shared.showOnboarding(openSettingsOnFinish: true)
     } else {
-        OnboardingWindowController.shared.showIfNeeded()
+        SettingsHelperLauncher.shared.showOnboardingIfNeeded()
     }
 }
 if InputSettings.shared.autoCheckAppUpdates {

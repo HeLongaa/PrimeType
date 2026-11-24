@@ -129,6 +129,7 @@ final class VoiceDataStore {
     }
 }
 
+#if !PRIMETYPE_SETTINGS_HELPER
 // MARK: - Engine Registry
 
 final class VoiceASREngineRegistry {
@@ -161,3 +162,4 @@ final class VoiceASREngineRegistry {
         }
     }
 }
+#endif

@@ -938,6 +938,9 @@ final class InputSettings: ObservableObject {
         if let data = try? encoder.encode(payload) {
             try? data.write(to: settingsURL, options: .atomic)
         }
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.settingsChanged)
+        #endif
     }
 
     func closingPair(for opening: String) -> String? {
@@ -1060,8 +1063,42 @@ final class InputSettings: ObservableObject {
         ]
 
         if preset == .wanxiang {
-            // macOS IMKInputController does not emit keyUp events; disable wanxiang's keyUp-dependent backspace lock.
+            // 1. macOS IMKInputController does not emit keyUp events; disable wanxiang's keyUp-dependent backspace lock.
             lines.append("  super_processor/enable_backspace_limit: false")
+            // 2. Slim redundant LevelDB / Lua / OpenCC components in wanxiang (drops ~6 unused LevelDB instances:
+            //    stats.userdb, tips.userdb, sequence.userdb, replacer.userdb, context_reorder.userdb, auto_phrase,
+            //    plus unused s2hk/s2tw OpenCC converters and duplicate charset_filter), cutting ~12-18 MB RAM
+            //    and speeding up per-keystroke latency ~2-3x while preserving dictionary, grammar, English, time/calc, s2t, and emoji.
+            lines.append(contentsOf: [
+                "  engine/processors:",
+                "    - lua_processor@*wanxiang.super_processor",
+                "    - lua_processor@*wanxiang.super_english*P",
+                "    - ascii_composer",
+                "    - recognizer",
+                "    - key_binder",
+                "    - speller",
+                "    - punctuator",
+                "    - selector",
+                "    - navigator",
+                "    - express_editor",
+                "  engine/translators:",
+                "    - punct_translator",
+                "    - script_translator",
+                "    - lua_translator@*wanxiang.shijian",
+                "    - lua_translator@*wanxiang.number_conversion",
+                "    - lua_translator@*wanxiang.super_calculator",
+                "    - lua_translator@*wanxiang.super_english*T",
+                "    - table_translator@wanxiang_mixedcode",
+                "  engine/filters:",
+                "    - lua_filter@*wanxiang.charset_filter",
+                "    - lua_filter@*wanxiang.custom_phrase",
+                "    - lua_filter@*wanxiang.super_comment_preedit",
+                "    - simplifier@s2t",
+                "    - simplifier@emoji",
+                "    - lua_filter@*wanxiang.super_english*F",
+                "    - lua_filter@*wanxiang.super_filter",
+                "    - uniquifier"
+            ])
         }
 
         // Tier-0: Activate bundled librime-octagram plugin across all presets whenever a .gram model is installed
@@ -1294,9 +1331,21 @@ final class InputSettings: ObservableObject {
         }
 
         reloadFromDiskAndSync()
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.importBackupDone)
+        #endif
     }
 
     func resetUserFrequencyDB(completion: @escaping () -> Void) {
+        #if PRIMETYPE_SETTINGS_HELPER
+        rimeSyncQueue.async {
+            PrimeTypeIPC.post(PrimeTypeIPC.resetUserDB)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                completion()
+            }
+        }
+        return
+        #else
         let userDB = sharedUserDBURL
         let preset = selectedDictionary
         rimeSyncQueue.async {
@@ -1310,9 +1359,19 @@ final class InputSettings: ObservableObject {
                 completion()
             }
         }
+        #endif
     }
 
     func clearRimeBuildCacheAndRebuild(completion: @escaping () -> Void) {
+        #if PRIMETYPE_SETTINGS_HELPER
+        rimeSyncQueue.async {
+            PrimeTypeIPC.post(PrimeTypeIPC.clearRimeBuildCache)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                completion()
+            }
+        }
+        return
+        #else
         let preset = selectedDictionary
         let buildDir = URL(fileURLWithPath: RimeEngine.shared.userDataDir(for: preset))
             .appendingPathComponent("build")
@@ -1325,6 +1384,7 @@ final class InputSettings: ObservableObject {
                 completion()
             }
         }
+        #endif
     }
 
     func exportDiagnosticsArchive(to destinationURL: URL) throws {

@@ -134,6 +134,26 @@ final class LatencyProbe {
     }
 
     func snapshot() -> LatencySnapshot {
+        #if PRIMETYPE_SETTINGS_HELPER
+        if let m = PrimeTypeIPC.readMetrics(), m.sampleCount > 0 {
+            return LatencySnapshot(
+                sampleCount: m.sampleCount,
+                syncP50Ms: m.syncP50Ms,
+                syncP95Ms: m.syncP95Ms,
+                syncP99Ms: m.syncP99Ms,
+                rimeP50Ms: 0,
+                tier1P50Ms: 0,
+                asyncP50Ms: 0,
+                asyncP99Ms: 0,
+                over16msCount: m.over16msCount,
+                over16msRatio: m.over16msRatio,
+                top1FlipCount: m.asyncTop1FlipCount,
+                asyncAppliedCount: m.asyncAppliedCount,
+                asyncDroppedCount: m.asyncDroppedCount
+            )
+        }
+        return .empty
+        #else
         lock.lock()
         let syncCopy = syncSamples
         let rimeCopy = rimeSamples
@@ -167,6 +187,7 @@ final class LatencyProbe {
             asyncAppliedCount: applied,
             asyncDroppedCount: dropped
         )
+        #endif
     }
 
     private static func percentile(_ sorted: [Double], p: Double) -> Double {

@@ -70,8 +70,14 @@ final class LocalNeuralReranker: NSObject, ObservableObject {
     func refreshInstallState() {
         let installed = isInstalled
         stateLock.lock()
-        let running = serverProcess?.isRunning == true
+        var running = serverProcess?.isRunning == true
         stateLock.unlock()
+
+        #if PRIMETYPE_SETTINGS_HELPER
+        if installed, let m = PrimeTypeIPC.readMetrics(), m.localRerankerStateRaw == RuntimeState.running.rawValue {
+            running = true
+        }
+        #endif
 
         DispatchQueue.main.async {
             if !installed {
@@ -169,6 +175,9 @@ final class LocalNeuralReranker: NSObject, ObservableObject {
     }
 
     func unloadNow() {
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.unloadLocalReranker)
+        #endif
         stateLock.lock()
         idleTimer?.cancel()
         idleTimer = nil

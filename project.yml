@@ -13,6 +13,8 @@ targets:
       - path: Sources/InputType
         excludes:
           - Resources/**
+          - UI/SettingsWindowController.swift
+          - UI/OnboardingWindowController.swift
       - path: Sources/InputType/Resources
         type: group
     settings:
@@ -75,6 +77,54 @@ targets:
               "${PROJECT_DIR}/Resources/Dictionaries/" "${RESOURCES_DIR}/Dictionaries/"
           fi
 
+          if [ -d "${PROJECT_DIR}/Resources/SidebarIcons" ]; then
+            rm -rf "${RESOURCES_DIR}/SidebarIcons"
+            mkdir -p "${RESOURCES_DIR}/SidebarIcons"
+            cp -f "${PROJECT_DIR}/Resources/SidebarIcons/"*.png "${RESOURCES_DIR}/SidebarIcons/"
+          fi
+
+  PrimeTypeSettings:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/PrimeTypeSettings
+        excludes:
+          - Info.plist
+      - path: Sources/InputType/UI/SettingsWindowController.swift
+      - path: Sources/InputType/UI/OnboardingWindowController.swift
+      - path: Sources/InputType/App/InputSettings.swift
+      - path: Sources/InputType/App/GrammarModelManager.swift
+      - path: Sources/InputType/App/UpdateManager.swift
+      - path: Sources/InputType/App/LocalCodeSignManager.swift
+      - path: Sources/InputType/App/ClipboardManager.swift
+      - path: Sources/InputType/App/SettingsHelperLauncher.swift
+      - path: Sources/InputType/Rime/LatencyProbe.swift
+      - path: Sources/InputType/Rime/UserRankingEngine.swift
+      - path: Sources/InputType/Rime/LocalNeuralReranker.swift
+      - path: Sources/InputType/Rime/CandidatePipeline.swift
+      - path: Sources/InputType/Voice/VoiceASREngine.swift
+      - path: Sources/InputType/Voice/VoiceUtilitySupport.swift
+      - path: Sources/InputType/Resources
+        type: group
+    settings:
+      base:
+        PRODUCT_NAME: PrimeTypeSettings
+        PRODUCT_BUNDLE_IDENTIFIER: com.lumocore.inputmethod.PrimeType.Settings
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_FILE: Sources/PrimeTypeSettings/Info.plist
+        SWIFT_VERSION: "5.9"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "PRIMETYPE_SETTINGS_HELPER"
+        ENABLE_DEBUG_DYLIB: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        COMBINE_HIDPI_IMAGES: YES
+    postBuildScripts:
+      - name: Embed SidebarIcons for Settings Helper
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          RESOURCES_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
           if [ -d "${PROJECT_DIR}/Resources/SidebarIcons" ]; then
             rm -rf "${RESOURCES_DIR}/SidebarIcons"
             mkdir -p "${RESOURCES_DIR}/SidebarIcons"

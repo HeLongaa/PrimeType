@@ -602,6 +602,9 @@ final class ClipboardManager: ObservableObject {
         entries.removeAll()
         clearImageCache()
         saveToDisk()
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.clearClipboard)
+        #endif
     }
 
     private func deleteImageFile(for entry: ClipboardEntry) {

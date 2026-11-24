@@ -1,308 +1,488 @@
 import Cocoa
 import Carbon.HIToolbox
-import SwiftUI
+import Combine
 
-private struct TranslateShortcutBadge: View {
-    let key: String
-    let tint: Color
-    let background: Color
+// MARK: - Pure AppKit Pill Action Button
 
-    var body: some View {
-        Text(key)
-            .font(.system(size: 10.5, weight: .medium, design: .rounded))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
-            .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(background)
-            )
-    }
-}
+private final class TranslatePillButtonNSView: NSView {
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let badgeContainer = NSView()
+    private let badgeLabel = NSTextField(labelWithString: "")
+    private let onClick: () -> Void
+    private var isAccent: Bool
+    private var isEnabledState: Bool = true
+    private var isHovered = false
+    private var trackingAreaRef: NSTrackingArea?
 
-private struct TranslatePopupView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject var manager = TranslateManager.shared
-    @State private var textContentHeight: CGFloat = 22
+    init(title: String, shortcut: String, isAccent: Bool, onClick: @escaping () -> Void) {
+        self.isAccent = isAccent
+        self.onClick = onClick
+        super.init(frame: .zero)
 
-    private var hasResult: Bool {
-        !manager.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+        wantsLayer = true
+        layer?.cornerCurve = .continuous
 
-    var body: some View {
-        let isDark = (colorScheme == .dark)
-        VStack(alignment: .leading, spacing: 12) {
-            // Header row: icon + action title + subtle direction badge (for translate)
-            HStack(spacing: 8) {
-                Image(systemName: manager.activeAction.systemImage)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
+        titleLabel.stringValue = title
+        titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
 
-                Text(manager.activeAction.title)
-                    .font(.system(size: 14.5, weight: .semibold))
-                    .foregroundStyle(.primary)
+        badgeContainer.wantsLayer = true
+        badgeContainer.layer?.cornerCurve = .continuous
+        badgeContainer.layer?.cornerRadius = 4
 
-                Spacer()
-
-                if manager.activeAction == .translate && !manager.targetLanguageLabel.isEmpty {
-                    TranslateLanguageSelectorPill(manager: manager)
-                }
-            }
-
-            // Content area: spinner "正在处理..." / streaming translated text / error
-            Group {
-                if let error = manager.errorMessage {
-                    Text(error)
-                        .font(.system(size: 13.5))
-                        .foregroundStyle(isDark ? Color(red: 1.0, green: 0.45, blue: 0.48) : Color(red: 0.82, green: 0.16, blue: 0.22))
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if manager.isProcessing && manager.translatedText.isEmpty {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("正在处理...")
-                            .font(.system(size: 13.5))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 2)
-                } else {
-                    ScrollView {
-                        resultTextView
-                            .font(.system(size: 14))
-                            .lineSpacing(3)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                GeometryReader { geo in
-                                    Color.clear
-                                        .onAppear {
-                                            updateMeasuredTextHeight(geo.size.height)
-                                        }
-                                        .onChange(of: geo.size.height) { _, newHeight in
-                                            updateMeasuredTextHeight(newHeight)
-                                        }
-                                }
-                            )
-                    }
-                    .frame(height: min(max(textContentHeight, 22), 220))
-                }
-            }
-
-            // Footer pill action buttons (bottom-right: 关闭 / 拷贝 / 替换)
-            HStack(spacing: 8) {
-                if manager.isProcessing && !manager.translatedText.isEmpty {
-                    ProgressView()
-                        .controlSize(.mini)
-                }
-                Spacer()
-
-                Button {
-                    manager.close()
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("关闭")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.primary.opacity(0.86))
-                        TranslateShortcutBadge(
-                            key: "Esc",
-                            tint: .secondary,
-                            background: Color.primary.opacity(0.08)
-                        )
-                    }
-                    .padding(.leading, 12)
-                    .padding(.trailing, 9)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(Color.primary.opacity(isDark ? 0.11 : 0.08))
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    manager.copyResult()
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("拷贝")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(hasResult ? Color.primary.opacity(0.86) : Color.primary.opacity(0.32))
-                        TranslateShortcutBadge(
-                            key: "⌘C",
-                            tint: hasResult ? .secondary : Color.primary.opacity(0.24),
-                            background: Color.primary.opacity(hasResult ? 0.08 : 0.04)
-                        )
-                    }
-                    .padding(.leading, 12)
-                    .padding(.trailing, 9)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(Color.primary.opacity(hasResult ? (isDark ? 0.11 : 0.08) : 0.04))
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(!hasResult)
-
-                Button {
-                    manager.replaceResult()
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("替换")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(hasResult ? Color.accentColor : Color.accentColor.opacity(0.4))
-                        TranslateShortcutBadge(
-                            key: "↵",
-                            tint: hasResult ? Color.accentColor.opacity(0.88) : Color.accentColor.opacity(0.30),
-                            background: Color.accentColor.opacity(hasResult ? 0.16 : 0.07)
-                        )
-                    }
-                    .padding(.leading, 12)
-                    .padding(.trailing, 9)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(Color.accentColor.opacity(hasResult ? (isDark ? 0.24 : 0.14) : 0.08))
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(!hasResult)
-            }
-            .padding(.top, 2)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .frame(width: 440)
-        .fixedSize(horizontal: false, vertical: true)
-        .onChange(of: manager.translatedText) { _, newText in
-            if newText.isEmpty {
-                textContentHeight = 22
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var resultTextView: some View {
-        if manager.activeAction == .rewrite && !manager.diffChunks.isEmpty {
-            Text(attributedDiff(manager.diffChunks))
+        let baseFont = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        if let desc = baseFont.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: desc, size: 10.5) {
+            badgeLabel.font = f
         } else {
-            Text(manager.translatedText)
-                .foregroundStyle(.primary)
+            badgeLabel.font = baseFont
+        }
+        badgeLabel.stringValue = shortcut
+        badgeLabel.alignment = .center
+
+        addSubview(titleLabel)
+        badgeContainer.addSubview(badgeLabel)
+        addSubview(badgeContainer)
+        updateAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard isEnabledState != enabled else { return }
+        isEnabledState = enabled
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = trackingAreaRef { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        updateAppearance()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    func updateAppearance() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let hoverBoost: CGFloat = (isHovered && isEnabledState) ? 0.05 : 0.0
+        if isAccent {
+            let accent = NSColor.controlAccentColor
+            titleLabel.textColor = accent.withAlphaComponent(isEnabledState ? 1.0 : 0.40)
+            badgeLabel.textColor = accent.withAlphaComponent(isEnabledState ? 0.88 : 0.30)
+            badgeContainer.layer?.backgroundColor = accent.withAlphaComponent(isEnabledState ? 0.16 : 0.07).cgColor
+            layer?.backgroundColor = accent.withAlphaComponent(isEnabledState ? ((isDark ? 0.24 : 0.14) + hoverBoost) : 0.08).cgColor
+        } else {
+            titleLabel.textColor = NSColor.labelColor.withAlphaComponent(isEnabledState ? 0.86 : 0.32)
+            badgeLabel.textColor = isEnabledState ? .secondaryLabelColor : NSColor.labelColor.withAlphaComponent(0.24)
+            badgeContainer.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(isEnabledState ? 0.08 : 0.04).cgColor
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(isEnabledState ? ((isDark ? 0.11 : 0.08) + hoverBoost) : 0.04).cgColor
         }
     }
 
-    private func attributedDiff(_ chunks: [QuickActionDiffEngine.Chunk]) -> AttributedString {
-        let isDark = (colorScheme == .dark)
-        return chunks.reduce(into: AttributedString()) { result, chunk in
-            switch chunk {
-            case .equal(let text):
-                var run = AttributedString(text)
-                run.foregroundColor = Color.primary
-                result.append(run)
-            case .inserted(let text):
-                var run = AttributedString(text)
-                run.foregroundColor = isDark
-                    ? Color(red: 0.42, green: 0.88, blue: 0.50)
-                    : Color(red: 0.09, green: 0.58, blue: 0.24)
-                result.append(run)
-            case .deleted(let text):
-                var run = AttributedString(text)
-                run.foregroundColor = isDark
-                    ? Color(red: 1.0, green: 0.42, blue: 0.42)
-                    : Color(red: 0.82, green: 0.16, blue: 0.22)
-                run.strikethroughStyle = .single
-                result.append(run)
+    override var intrinsicContentSize: NSSize {
+        let t = titleLabel.fittingSize
+        let b = badgeLabel.fittingSize
+        let badgeW = ceil(b.width) + 10
+        let height = max(ceil(t.height), ceil(b.height) + 3) + 12
+        return NSSize(width: 12 + ceil(t.width) + 6 + badgeW + 9, height: height)
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height * 0.5
+        let t = titleLabel.fittingSize
+        let b = badgeLabel.fittingSize
+        let badgeW = ceil(b.width) + 10
+        let badgeH = ceil(b.height) + 3
+        titleLabel.frame = NSRect(x: 12, y: round((bounds.height - t.height) * 0.5), width: ceil(t.width), height: ceil(t.height))
+        let bx = 12 + ceil(t.width) + 6
+        badgeContainer.frame = NSRect(x: bx, y: round((bounds.height - badgeH) * 0.5), width: badgeW, height: badgeH)
+        badgeLabel.frame = NSRect(x: 5, y: round((badgeH - b.height) * 0.5), width: ceil(b.width), height: ceil(b.height))
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabledState else { return }
+        onClick()
+    }
+}
+
+// MARK: - Pure AppKit Language Selector Pill
+
+private final class TranslateLangPillNSView: NSView {
+    private let sourceBtn = NSButton()
+    private let swapBtn = NSButton()
+    private let targetBtn = NSButton()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerCurve = .continuous
+
+        for btn in [sourceBtn, swapBtn, targetBtn] {
+            btn.isBordered = false
+            btn.bezelStyle = .inline
+            btn.focusRingType = .none
+            addSubview(btn)
+        }
+
+        sourceBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        sourceBtn.target = self
+        sourceBtn.action = #selector(onSource)
+        sourceBtn.toolTip = "选择源语言"
+
+        let arrowCfg = NSImage.SymbolConfiguration(pointSize: 9.5, weight: .semibold)
+        swapBtn.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: nil)?.withSymbolConfiguration(arrowCfg)
+        swapBtn.contentTintColor = NSColor.labelColor.withAlphaComponent(0.55)
+        swapBtn.target = self
+        swapBtn.action = #selector(onSwap)
+        swapBtn.toolTip = "互换源语言与目标语言"
+
+        targetBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        targetBtn.target = self
+        targetBtn.action = #selector(onTarget)
+        targetBtn.toolTip = "选择目标语言"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func refresh(from manager: TranslateManager) {
+        let srcText = (manager.detectedLanguageLabel.isEmpty ? "自动" : manager.detectedLanguageLabel) + " ▾"
+        let dstText = manager.targetLanguageLabel + " ▾"
+        let attrsSrc: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor.withAlphaComponent(0.76)
+        ]
+        sourceBtn.attributedTitle = NSAttributedString(string: srcText, attributes: attrsSrc)
+        targetBtn.attributedTitle = NSAttributedString(string: dstText, attributes: attrsSrc)
+        swapBtn.isEnabled = (manager.selectedSourceLanguage != nil)
+        swapBtn.alphaValue = swapBtn.isEnabled ? 1.0 : 0.40
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.08).cgColor
+        needsLayout = true
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let sW = ceil(sourceBtn.fittingSize.width) + 8
+        let tW = ceil(targetBtn.fittingSize.width) + 8
+        return NSSize(width: 4 + sW + 2 + 18 + 2 + tW + 4, height: 22)
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height * 0.5
+        let sW = ceil(sourceBtn.fittingSize.width) + 8
+        let tW = ceil(targetBtn.fittingSize.width) + 8
+        var x: CGFloat = 4
+        sourceBtn.frame = NSRect(x: x, y: 1, width: sW, height: bounds.height - 2)
+        x += sW + 2
+        swapBtn.frame = NSRect(x: x, y: round((bounds.height - 18) * 0.5), width: 18, height: 18)
+        x += 20
+        targetBtn.frame = NSRect(x: x, y: 1, width: tW, height: bounds.height - 2)
+    }
+
+    @objc private func onSource() { TranslatePopupController.shared.presentSourceLanguageMenu() }
+    @objc private func onSwap() { TranslateManager.shared.swapLanguages() }
+    @objc private func onTarget() { TranslatePopupController.shared.presentTargetLanguageMenu() }
+}
+
+// MARK: - Pure AppKit Translate Popup Content View
+
+private final class TranslatePopupContentNSView: NSView {
+    private static let fixedWidth: CGFloat = 440
+
+    private let headerIcon = NSImageView()
+    private let headerTitle = NSTextField(labelWithString: "")
+    private let langPill = TranslateLangPillNSView()
+
+    private let errorLabel = NSTextField(wrappingLabelWithString: "")
+    private let loadingSpinner = NSProgressIndicator()
+    private let loadingLabel = NSTextField(labelWithString: "正在处理...")
+
+    private let scrollView = NSScrollView()
+    private let textView = NSTextView()
+    private var measuredTextHeight: CGFloat = 22
+
+    private let footerSpinner = NSProgressIndicator()
+    private let closeBtn: TranslatePillButtonNSView
+    private let copyBtn: TranslatePillButtonNSView
+    private let replaceBtn: TranslatePillButtonNSView
+
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        self.closeBtn = TranslatePillButtonNSView(title: "关闭", shortcut: "Esc", isAccent: false) {
+            TranslateManager.shared.close()
+        }
+        self.copyBtn = TranslatePillButtonNSView(title: "拷贝", shortcut: "⌘C", isAccent: false) {
+            TranslateManager.shared.copyResult()
+        }
+        self.replaceBtn = TranslatePillButtonNSView(title: "替换", shortcut: "↵", isAccent: true) {
+            TranslateManager.shared.replaceResult()
+        }
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        headerIcon.imageScaling = .scaleProportionallyDown
+        headerIcon.contentTintColor = .secondaryLabelColor
+
+        headerTitle.font = .systemFont(ofSize: 14.5, weight: .semibold)
+        headerTitle.textColor = .labelColor
+
+        errorLabel.font = .systemFont(ofSize: 13.5)
+        errorLabel.maximumNumberOfLines = 0
+
+        loadingSpinner.style = .spinning
+        loadingSpinner.controlSize = .small
+        loadingSpinner.isDisplayedWhenStopped = false
+
+        loadingLabel.font = .systemFont(ofSize: 13.5)
+        loadingLabel.textColor = .secondaryLabelColor
+
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 1)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        scrollView.documentView = textView
+
+        footerSpinner.style = .spinning
+        footerSpinner.controlSize = .mini
+        footerSpinner.isDisplayedWhenStopped = false
+
+        addSubview(headerIcon)
+        addSubview(headerTitle)
+        addSubview(langPill)
+        addSubview(errorLabel)
+        addSubview(loadingSpinner)
+        addSubview(loadingLabel)
+        addSubview(scrollView)
+        addSubview(footerSpinner)
+        addSubview(closeBtn)
+        addSubview(copyBtn)
+        addSubview(replaceBtn)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refresh(from: TranslateManager.shared)
+    }
+
+    func refresh(from manager: TranslateManager) {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        headerIcon.image = NSImage(systemSymbolName: manager.activeAction.systemImage, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+        headerTitle.stringValue = manager.activeAction.title
+
+        let showLang = (manager.activeAction == .translate && !manager.targetLanguageLabel.isEmpty)
+        langPill.isHidden = !showLang
+        if showLang {
+            langPill.refresh(from: manager)
+        }
+
+        let hasResult = !manager.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        copyBtn.setEnabled(hasResult)
+        replaceBtn.setEnabled(hasResult)
+        closeBtn.updateAppearance()
+
+        if let error = manager.errorMessage {
+            errorLabel.isHidden = false
+            errorLabel.stringValue = error
+            errorLabel.textColor = isDark
+                ? NSColor(srgbRed: 1.0, green: 0.45, blue: 0.48, alpha: 1.0)
+                : NSColor(srgbRed: 0.82, green: 0.16, blue: 0.22, alpha: 1.0)
+            loadingSpinner.stopAnimation(nil)
+            loadingSpinner.isHidden = true
+            loadingLabel.isHidden = true
+            scrollView.isHidden = true
+        } else if manager.isProcessing && manager.translatedText.isEmpty {
+            errorLabel.isHidden = true
+            loadingSpinner.isHidden = false
+            loadingSpinner.startAnimation(nil)
+            loadingLabel.isHidden = false
+            scrollView.isHidden = true
+            measuredTextHeight = 22
+        } else {
+            errorLabel.isHidden = true
+            loadingSpinner.stopAnimation(nil)
+            loadingSpinner.isHidden = true
+            loadingLabel.isHidden = true
+            scrollView.isHidden = false
+
+            let attr = buildResultAttributedString(manager: manager, isDark: isDark)
+            textView.textStorage?.setAttributedString(attr)
+            let contentWidth = Self.fixedWidth - 32
+            textView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: 10)
+            textView.textContainer?.containerSize = NSSize(width: contentWidth, height: .greatestFiniteMagnitude)
+            if let lm = textView.layoutManager, let tc = textView.textContainer {
+                lm.ensureLayout(for: tc)
+                let used = lm.usedRect(for: tc).height + 4
+                measuredTextHeight = min(max(ceil(used), 22), 220)
             }
         }
+
+        let showFooterSpin = manager.isProcessing && !manager.translatedText.isEmpty
+        footerSpinner.isHidden = !showFooterSpin
+        if showFooterSpin {
+            footerSpinner.startAnimation(nil)
+        } else {
+            footerSpinner.stopAnimation(nil)
+        }
+
+        needsLayout = true
+        layoutSubtreeIfNeeded()
     }
 
-    private func updateMeasuredTextHeight(_ height: CGFloat) {
-        let clamped = max(22, ceil(height))
-        guard abs(clamped - textContentHeight) > 0.5 else { return }
-        textContentHeight = clamped
-        DispatchQueue.main.async {
-            TranslatePopupController.shared.updateLayout()
+    private func buildResultAttributedString(manager: TranslateManager, isDark: Bool) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        let font = NSFont.systemFont(ofSize: 14)
+
+        if manager.activeAction == .rewrite && !manager.diffChunks.isEmpty {
+            let result = NSMutableAttributedString()
+            for chunk in manager.diffChunks {
+                switch chunk {
+                case .equal(let text):
+                    result.append(NSAttributedString(string: text, attributes: [
+                        .font: font,
+                        .foregroundColor: NSColor.labelColor,
+                        .paragraphStyle: paragraph
+                    ]))
+                case .inserted(let text):
+                    let color = isDark
+                        ? NSColor(srgbRed: 0.42, green: 0.88, blue: 0.50, alpha: 1.0)
+                        : NSColor(srgbRed: 0.09, green: 0.58, blue: 0.24, alpha: 1.0)
+                    result.append(NSAttributedString(string: text, attributes: [
+                        .font: font,
+                        .foregroundColor: color,
+                        .paragraphStyle: paragraph
+                    ]))
+                case .deleted(let text):
+                    let color = isDark
+                        ? NSColor(srgbRed: 1.0, green: 0.42, blue: 0.42, alpha: 1.0)
+                        : NSColor(srgbRed: 0.82, green: 0.16, blue: 0.22, alpha: 1.0)
+                    result.append(NSAttributedString(string: text, attributes: [
+                        .font: font,
+                        .foregroundColor: color,
+                        .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+                        .paragraphStyle: paragraph
+                    ]))
+                }
+            }
+            return result
         }
+
+        return NSAttributedString(string: manager.translatedText, attributes: [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph
+        ])
+    }
+
+    func preferredSize() -> NSSize {
+        let contentW = Self.fixedWidth - 32
+        let headerH: CGFloat = 22
+        let bodyH: CGFloat
+        if !errorLabel.isHidden {
+            errorLabel.preferredMaxLayoutWidth = contentW
+            bodyH = max(22, ceil(errorLabel.fittingSize.height))
+        } else if !loadingLabel.isHidden {
+            bodyH = 24
+        } else {
+            bodyH = measuredTextHeight
+        }
+        let footerH = max(closeBtn.intrinsicContentSize.height, 28)
+        let totalH = 14 + headerH + 12 + bodyH + 14 + footerH + 14
+        return NSSize(width: Self.fixedWidth, height: ceil(totalH))
+    }
+
+    override func layout() {
+        super.layout()
+        let contentW = bounds.width - 32
+        var y: CGFloat = 14
+
+        // Header
+        let headerH: CGFloat = 22
+        headerIcon.frame = NSRect(x: 16, y: y + 3, width: 16, height: 16)
+        let titleSize = headerTitle.fittingSize
+        headerTitle.frame = NSRect(x: 40, y: y + round((headerH - titleSize.height) * 0.5), width: min(220, ceil(titleSize.width)), height: ceil(titleSize.height))
+        if !langPill.isHidden {
+            let pillSize = langPill.intrinsicContentSize
+            langPill.frame = NSRect(x: bounds.width - 16 - pillSize.width, y: y, width: pillSize.width, height: pillSize.height)
+        }
+        y += headerH + 12
+
+        // Body
+        if !errorLabel.isHidden {
+            errorLabel.preferredMaxLayoutWidth = contentW
+            let h = max(22, ceil(errorLabel.fittingSize.height))
+            errorLabel.frame = NSRect(x: 16, y: y, width: contentW, height: h)
+            y += h
+        } else if !loadingLabel.isHidden {
+            loadingSpinner.frame = NSRect(x: 16, y: y + 4, width: 16, height: 16)
+            let ls = loadingLabel.fittingSize
+            loadingLabel.frame = NSRect(x: 40, y: y + round((24 - ls.height) * 0.5), width: ceil(ls.width), height: ceil(ls.height))
+            y += 24
+        } else {
+            scrollView.frame = NSRect(x: 16, y: y, width: contentW, height: measuredTextHeight)
+            y += measuredTextHeight
+        }
+
+        y += 14
+
+        // Footer
+        let rSize = replaceBtn.intrinsicContentSize
+        let cSize = copyBtn.intrinsicContentSize
+        let xSize = closeBtn.intrinsicContentSize
+        let footerH = max(rSize.height, 28)
+
+        if !footerSpinner.isHidden {
+            footerSpinner.frame = NSRect(x: 16, y: y + round((footerH - 12) * 0.5), width: 12, height: 12)
+        }
+
+        var rx = bounds.width - 16 - rSize.width
+        replaceBtn.frame = NSRect(x: rx, y: y, width: rSize.width, height: rSize.height)
+        rx -= (8 + cSize.width)
+        copyBtn.frame = NSRect(x: rx, y: y, width: cSize.width, height: cSize.height)
+        rx -= (8 + xSize.width)
+        closeBtn.frame = NSRect(x: rx, y: y, width: xSize.width, height: xSize.height)
     }
 }
 
-private struct TranslateLanguageSelectorPill: View {
-    @ObservedObject var manager: TranslateManager
-    @State private var hoverSource = false
-    @State private var hoverTarget = false
-    @State private var hoverSwap = false
-
-    var body: some View {
-        HStack(spacing: 2) {
-            Button {
-                TranslatePopupController.shared.presentSourceLanguageMenu()
-            } label: {
-                HStack(spacing: 3) {
-                    Text(manager.detectedLanguageLabel.isEmpty ? "自动" : manager.detectedLanguageLabel)
-                        .font(.system(size: 11, weight: .medium))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 7.5, weight: .semibold))
-                        .opacity(0.7)
-                }
-                .foregroundStyle(Color.primary.opacity(hoverSource ? 0.92 : 0.70))
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule()
-                        .fill(Color.primary.opacity(hoverSource ? 0.11 : 0.0))
-                )
-            }
-            .buttonStyle(.plain)
-            .onHover { hoverSource = $0 }
-            .help("选择源语言")
-
-            Button {
-                manager.swapLanguages()
-            } label: {
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(Color.primary.opacity(hoverSwap ? 0.92 : 0.48))
-                    .frame(width: 18, height: 18)
-                    .background(
-                        Circle()
-                            .fill(Color.primary.opacity(hoverSwap ? 0.11 : 0.0))
-                    )
-            }
-            .buttonStyle(.plain)
-            .disabled(manager.selectedSourceLanguage == nil)
-            .onHover { hoverSwap = $0 }
-            .help("互换源语言与目标语言")
-
-            Button {
-                TranslatePopupController.shared.presentTargetLanguageMenu()
-            } label: {
-                HStack(spacing: 3) {
-                    Text(manager.targetLanguageLabel)
-                        .font(.system(size: 11, weight: .medium))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 7.5, weight: .semibold))
-                        .opacity(0.7)
-                }
-                .foregroundStyle(Color.primary.opacity(hoverTarget ? 0.92 : 0.74))
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule()
-                        .fill(Color.primary.opacity(hoverTarget ? 0.11 : 0.0))
-                )
-            }
-            .buttonStyle(.plain)
-            .onHover { hoverTarget = $0 }
-            .help("选择目标语言")
-        }
-        .padding(.horizontal, 3)
-        .padding(.vertical, 1.5)
-        .background(
-            Capsule()
-                .fill(Color.primary.opacity(0.08))
-        )
-    }
-}
+// MARK: - TranslatePanel & TranslatePopupController
 
 private final class TranslatePanel: NSPanel {
     enum KeyAction {
@@ -345,29 +525,26 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
 
     private struct PopupPlacement {
         let lockedX: CGFloat
-        let anchorTopY: CGFloat    // y above which the panel sits when placed above
-        let anchorBottomY: CGFloat // y below which the panel sits when placed below
+        let anchorTopY: CGFloat
+        let anchorBottomY: CGFloat
         let isAbove: Bool
         let visibleFrame: NSRect
     }
 
     private let panel: TranslatePanel
-    private let hostingView: NSHostingView<TranslatePopupView>
+    private let contentNSView: TranslatePopupContentNSView
     private var activePlacement: PopupPlacement?
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
     private var isHiding = false
     private var isPresentingMenu = false
     private var menuActionTargets: [MenuActionTrampoline] = []
+    private var cancellables: Set<AnyCancellable> = []
 
     private final class MenuActionTrampoline: NSObject {
         let handler: () -> Void
-        init(_ handler: @escaping () -> Void) {
-            self.handler = handler
-        }
-        @objc func invoke(_ sender: Any?) {
-            handler()
-        }
+        init(_ handler: @escaping () -> Void) { self.handler = handler }
+        @objc func invoke(_ sender: Any?) { handler() }
     }
 
     var isVisible: Bool { panel.isVisible }
@@ -375,7 +552,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
 
     private override init() {
         let p = TranslatePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 140),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 140),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -390,13 +567,11 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
         p.isMovableByWindowBackground = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
 
-        let host = NSHostingView(rootView: TranslatePopupView())
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
-        host.layer?.cornerCurve = .continuous
-        host.layer?.cornerRadius = 20
-        host.layer?.masksToBounds = true
-        host.autoresizingMask = [.width, .height]
+        let view = TranslatePopupContentNSView(frame: NSRect(x: 0, y: 0, width: 440, height: 140))
+        view.layer?.cornerCurve = .continuous
+        view.layer?.cornerRadius = 20
+        view.layer?.masksToBounds = true
+        view.autoresizingMask = [.width, .height]
 
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
@@ -407,7 +582,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
             glass.layer?.cornerCurve = .continuous
             glass.layer?.cornerRadius = 20
             glass.layer?.masksToBounds = true
-            glass.contentView = host
+            glass.contentView = view
             p.contentView = glass
         } else {
             let effect = NSVisualEffectView()
@@ -418,36 +593,49 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
             effect.layer?.masksToBounds = true
             effect.layer?.cornerCurve = .continuous
             effect.layer?.cornerRadius = 20
-            host.translatesAutoresizingMaskIntoConstraints = false
-            effect.addSubview(host)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(view)
             NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-                host.topAnchor.constraint(equalTo: effect.topAnchor),
-                host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+                view.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                view.topAnchor.constraint(equalTo: effect.topAnchor),
+                view.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
             ])
             p.contentView = effect
         }
 
         self.panel = p
-        self.hostingView = host
+        self.contentNSView = view
         super.init()
 
         p.delegate = self
         p.onKeyAction = { action in
             switch action {
-            case .close:
-                TranslateManager.shared.close()
-            case .copy:
-                TranslateManager.shared.copyResult()
-            case .replace:
-                TranslateManager.shared.replaceResult()
+            case .close: TranslateManager.shared.close()
+            case .copy: TranslateManager.shared.copyResult()
+            case .replace: TranslateManager.shared.replaceResult()
             }
         }
+        bindManager()
+    }
+
+    private func bindManager() {
+        let mgr = TranslateManager.shared
+        mgr.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.contentNSView.refresh(from: TranslateManager.shared)
+                if self.panel.isVisible {
+                    self.applyActivePlacement()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     func show(near anchorRect: NSRect?, makeKey: Bool = true) {
         isHiding = false
+        contentNSView.refresh(from: TranslateManager.shared)
         activePlacement = computeInitialPlacement(anchorRect: anchorRect)
         applyActivePlacement()
         if makeKey {
@@ -465,11 +653,8 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
 
     func updateLayout() {
         guard panel.isVisible else { return }
+        contentNSView.refresh(from: TranslateManager.shared)
         applyActivePlacement()
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.panel.isVisible else { return }
-            self.applyActivePlacement()
-        }
     }
 
     func hide() {
@@ -488,9 +673,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
         let menu = NSMenu(title: "源语言")
         var trampolines: [MenuActionTrampoline] = []
 
-        let autoTrampoline = MenuActionTrampoline {
-            manager.setSourceLanguage(nil)
-        }
+        let autoTrampoline = MenuActionTrampoline { manager.setSourceLanguage(nil) }
         trampolines.append(autoTrampoline)
         let autoItem = NSMenuItem(title: "自动检测", action: #selector(MenuActionTrampoline.invoke(_:)), keyEquivalent: "")
         autoItem.target = autoTrampoline
@@ -499,9 +682,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
         menu.addItem(.separator())
 
         for lang in TranslateLanguage.allCases {
-            let trampoline = MenuActionTrampoline {
-                manager.setSourceLanguage(lang)
-            }
+            let trampoline = MenuActionTrampoline { manager.setSourceLanguage(lang) }
             trampolines.append(trampoline)
             let item = NSMenuItem(title: lang.displayName, action: #selector(MenuActionTrampoline.invoke(_:)), keyEquivalent: "")
             item.target = trampoline
@@ -518,9 +699,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
         var trampolines: [MenuActionTrampoline] = []
 
         for lang in TranslateLanguage.allCases {
-            let trampoline = MenuActionTrampoline {
-                manager.setTargetLanguage(lang)
-            }
+            let trampoline = MenuActionTrampoline { manager.setTargetLanguage(lang) }
             trampolines.append(trampoline)
             let item = NSMenuItem(title: lang.displayName, action: #selector(MenuActionTrampoline.invoke(_:)), keyEquivalent: "")
             item.target = trampoline
@@ -549,8 +728,6 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
         }
     }
 
-    // MARK: - Outside Click & Resign Key Dismissal
-
     func windowDidResignKey(_ notification: Notification) {
         guard !isHiding, !isPresentingMenu, panel.isVisible else { return }
         TranslateManager.shared.close()
@@ -558,7 +735,6 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
 
     private func installOutsideClickMonitors() {
         removeOutsideClickMonitors()
-
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] _ in
@@ -567,7 +743,6 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
                 TranslateManager.shared.close()
             }
         }
-
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] event in
@@ -591,8 +766,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
     }
 
     private func computeInitialPlacement(anchorRect: NSRect?) -> PopupPlacement {
-        hostingView.layoutSubtreeIfNeeded()
-        let size = hostingView.fittingSize
+        let size = contentNSView.preferredSize()
         let panelWidth = size.width > 0 ? size.width : 440
         let panelHeight = size.height > 0 ? size.height : 120
 
@@ -633,8 +807,7 @@ final class TranslatePopupController: NSObject, NSWindowDelegate {
     }
 
     private func applyActivePlacement() {
-        hostingView.layoutSubtreeIfNeeded()
-        let size = hostingView.fittingSize
+        let size = contentNSView.preferredSize()
         guard size.width > 0 && size.height > 0 else { return }
 
         let placement = activePlacement ?? computeInitialPlacement(anchorRect: nil)

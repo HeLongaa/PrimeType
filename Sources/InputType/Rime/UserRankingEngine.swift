@@ -247,9 +247,17 @@ final class UserRankingEngine {
                 try? FileManager.default.removeItem(at: storageURL)
             }
         }
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.resetUserRanking)
+        #endif
     }
 
     var entryCount: Int {
+        #if PRIMETYPE_SETTINGS_HELPER
+        if let m = PrimeTypeIPC.readMetrics() {
+            return m.userRankingEntryCount
+        }
+        #endif
         lock.lock()
         defer { lock.unlock() }
         return byCodeWord.count

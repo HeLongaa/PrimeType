@@ -13,6 +13,20 @@ final class InputTypeController: IMKInputController {
     private static var lastKnownCursorRect: NSRect?
     private static var lastKnownCursorBundleID: String?
 
+    /// Trims bounded UI appearance caches during idle memory pressure relief.
+    static func trimCachesIfNeeded() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if cachedAppearanceByBundleID.count > 24 {
+            cachedAppearanceByBundleID = cachedAppearanceByBundleID.filter { (now - $0.value.timestamp) < 60.0 }
+            if cachedAppearanceByBundleID.count > 24 {
+                cachedAppearanceByBundleID.removeAll(keepingCapacity: false)
+            }
+        }
+        if cachedEditorStorageTheme.count > 12 {
+            cachedEditorStorageTheme.removeAll(keepingCapacity: false)
+        }
+    }
+
     private var sessionId: RimeSessionId = 0
     private var engineGeneration: UInt64 = 0
     private weak var currentClient: (any IMKTextInput)?
@@ -137,6 +151,7 @@ final class InputTypeController: IMKInputController {
         if wasActiveController {
             hideCandidatesImmediately()
         }
+        MemoryPressureManager.shared.noteInputDeactivated()
         super.deactivateServer(sender)
     }
 
@@ -549,6 +564,7 @@ final class InputTypeController: IMKInputController {
 
         guard event.type == .keyDown else { return false }
         let keystrokeStartAt = CFAbsoluteTimeGetCurrent()
+        MemoryPressureManager.shared.noteTypingActivity()
         candidatePresenter.noteKeystroke(now: keystrokeStartAt)
         queryCoordinator.cancelAll()
         pendingCommandKeyCode = nil
@@ -1087,7 +1103,7 @@ final class InputTypeController: IMKInputController {
         case .settings:
             exitVMode(client: client, clearMarked: true)
             DispatchQueue.main.async {
-                SettingsWindowController.shared.show()
+                SettingsHelperLauncher.shared.showSettings()
             }
         }
     }
@@ -3105,7 +3121,7 @@ final class InputTypeController: IMKInputController {
 
     override func showPreferences(_ sender: Any!) {
         DispatchQueue.main.async {
-            SettingsWindowController.shared.show()
+            SettingsHelperLauncher.shared.showSettings()
         }
     }
 
@@ -3243,7 +3259,7 @@ final class InputTypeController: IMKInputController {
 
     @objc private func menuOpenAbout(_ sender: Any?) {
         DispatchQueue.main.async {
-            SettingsWindowController.shared.showAbout()
+            SettingsHelperLauncher.shared.showAbout()
         }
     }
 }

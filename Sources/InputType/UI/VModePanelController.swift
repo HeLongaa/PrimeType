@@ -1,5 +1,5 @@
 import Cocoa
-import SwiftUI
+import Combine
 
 enum VModeMenuItem: Int, CaseIterable, Identifiable {
     case calculator = 1
@@ -597,17 +597,53 @@ enum VModeMathEvaluator {
     }
 }
 
-// MARK: - SwiftUI V-Mode Panel View
+// MARK: - Pure AppKit V-Mode Panel View (Zero SwiftUI)
 
-private struct VModePopupView: View {
-    @ObservedObject var state: VModeState
-    let onSelectMenuItem: (VModeMenuItem) -> Void
-    let onCommitText: (String) -> Void
-    let onBackToMenu: () -> Void
-    let onOpenSettings: () -> Void
+private final class VModeClickableRowNSView: NSView {
+    var onClick: (() -> Void)?
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
 
-    private var highlightColor: Color {
-        Color.accentColor
+private final class VModeFlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class VModeContentNSView: NSView {
+    private let state: VModeState
+    private let onSelectMenuItem: (VModeMenuItem) -> Void
+    private let onCommitText: (String) -> Void
+    private let onBackToMenu: () -> Void
+    private let onOpenSettings: () -> Void
+
+    private var computedSize = NSSize(width: 254, height: 180)
+    private var symbolGridScrollView: NSScrollView?
+    private var symbolCategoryScrollView: NSScrollView?
+    private var lastSymbolCategory: VModeSymbolCategory?
+
+    override var isFlipped: Bool { true }
+
+    init(
+        state: VModeState,
+        onSelectMenuItem: @escaping (VModeMenuItem) -> Void,
+        onCommitText: @escaping (String) -> Void,
+        onBackToMenu: @escaping () -> Void,
+        onOpenSettings: @escaping () -> Void
+    ) {
+        self.state = state
+        self.onSelectMenuItem = onSelectMenuItem
+        self.onCommitText = onCommitText
+        self.onBackToMenu = onBackToMenu
+        self.onOpenSettings = onOpenSettings
+        super.init(frame: NSRect(x: 0, y: 0, width: 254, height: 180))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 
     private var panelWidth: CGFloat {
@@ -618,317 +654,394 @@ private struct VModePopupView: View {
         }
     }
 
-    var body: some View {
-        Group {
-            switch state.page {
-            case .menu:
-                menuGridView
-            case .calculator:
-                calculatorView
-            case .phrases:
-                phrasesView
-            case .symbols:
-                symbolsView
-            case .dateTime:
-                dateTimeView
-            }
-        }
-        .frame(width: panelWidth)
-        .fixedSize(horizontal: false, vertical: true)
-        .environment(\.colorScheme, state.isDark ? .dark : .light)
+    func preferredSize() -> NSSize {
+        computedSize
     }
 
-    // MARK: 2-Column Main Menu (Matches WeType V-Mode Grid)
+    func rebuild() {
+        for sub in subviews { sub.removeFromSuperview() }
+        symbolGridScrollView = nil
+        symbolCategoryScrollView = nil
 
-    private var menuGridView: some View {
+        let w = panelWidth
+        let h: CGFloat
+        switch state.page {
+        case .menu:
+            h = buildMenuGrid(width: w)
+        case .calculator:
+            h = buildCalculator(width: w)
+        case .phrases:
+            h = buildPhrases(width: w)
+        case .dateTime:
+            h = buildDateTime(width: w)
+        case .symbols:
+            h = buildSymbols(width: w)
+        }
+        computedSize = NSSize(width: w, height: max(h, 36))
+    }
+
+    // MARK: 2-Column Main Menu
+
+    private func buildMenuGrid(width: CGFloat) -> CGFloat {
         let items = VModeMenuItem.allCases
         let rowCount = (items.count + 1) / 2
-        return VStack(spacing: 0) {
-            ForEach(0..<rowCount, id: \.self) { row in
-                let leftIdx = row * 2
-                let rightIdx = leftIdx + 1
-                HStack(spacing: 3) {
-                    menuCell(item: items[leftIdx], index: leftIdx)
-                    if rightIdx < items.count {
-                        menuCell(item: items[rightIdx], index: rightIdx)
-                    } else {
-                        Color.clear
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 27)
-                    }
-                }
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2.5)
+        let colW = (width - 8 - 3) * 0.5
+        var y: CGFloat = 1.5
 
-                if row < rowCount - 1 {
-                    Divider()
-                        .opacity(state.isDark ? 0.16 : 0.22)
-                }
+        for row in 0..<rowCount {
+            let leftIdx = row * 2
+            let rightIdx = leftIdx + 1
+            y += 2.5
+
+            let leftCell = makeMenuCell(item: items[leftIdx], index: leftIdx, frame: NSRect(x: 4, y: y, width: colW, height: 27))
+            addSubview(leftCell)
+            if rightIdx < items.count {
+                let rightCell = makeMenuCell(item: items[rightIdx], index: rightIdx, frame: NSRect(x: 4 + colW + 3, y: y, width: colW, height: 27))
+                addSubview(rightCell)
+            }
+            y += 27 + 2.5
+
+            if row < rowCount - 1 {
+                addSubview(makeDivider(y: y, width: width, alpha: state.isDark ? 0.16 : 0.22))
+                y += 1
             }
         }
-        .padding(.vertical, 1.5)
+        return y + 1.5
     }
 
-    private func menuCell(item: VModeMenuItem, index: Int) -> some View {
+    private func makeMenuCell(item: VModeMenuItem, index: Int, frame: NSRect) -> NSView {
         let isSelected = (state.selectedMenuIndex == index)
-        return Button {
-            onSelectMenuItem(item)
-        } label: {
-            HStack(spacing: 5.5) {
-                Text(item.badgeLabel)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(isSelected ? Color.white.opacity(0.95) : Color.secondary)
-                    .frame(width: 11, alignment: .center)
+        let cell = VModeClickableRowNSView(frame: frame)
+        cell.wantsLayer = true
+        cell.layer?.cornerCurve = .continuous
+        cell.layer?.cornerRadius = 6
+        cell.layer?.backgroundColor = isSelected ? NSColor.controlAccentColor.cgColor : NSColor.clear.cgColor
+        cell.onClick = { [weak self] in self?.onSelectMenuItem(item) }
 
-                Image(systemName: item.systemImage)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(0.85))
-                    .frame(width: 15, alignment: .center)
-
-                Text(item.title)
-                    .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
-                    .foregroundStyle(isSelected ? Color.white : Color.primary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 7)
-            .frame(maxWidth: .infinity)
-            .frame(height: 27)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isSelected ? highlightColor : Color.clear)
-            )
-            .contentShape(Rectangle())
+        let badge = NSTextField(labelWithString: item.badgeLabel)
+        let baseFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        if let desc = baseFont.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: desc, size: 12) {
+            badge.font = f
+        } else {
+            badge.font = baseFont
         }
-        .buttonStyle(.plain)
+        badge.alignment = .center
+        badge.textColor = isSelected ? NSColor.white.withAlphaComponent(0.95) : .secondaryLabelColor
+        badge.frame = NSRect(x: 7, y: 6, width: 11, height: 15)
+        cell.addSubview(badge)
+
+        let icon = NSImageView(frame: NSRect(x: 23.5, y: 6, width: 15, height: 15))
+        let cfg = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        icon.image = NSImage(systemSymbolName: item.systemImage, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+        icon.contentTintColor = isSelected ? .white : NSColor.labelColor.withAlphaComponent(0.85)
+        icon.imageScaling = .scaleProportionallyDown
+        cell.addSubview(icon)
+
+        let title = NSTextField(labelWithString: item.title)
+        title.font = .systemFont(ofSize: 12.5, weight: isSelected ? .medium : .regular)
+        title.textColor = isSelected ? .white : .labelColor
+        title.lineBreakMode = .byTruncatingTail
+        title.frame = NSRect(x: 44, y: 5.5, width: max(20, frame.width - 50), height: 16)
+        cell.addSubview(title)
+
+        return cell
     }
 
-    // MARK: Calculator Sub-Mode (Matches Image 1 & Image 2 Clean Candidate List)
+    // MARK: Calculator Sub-Mode
 
-    private var calculatorView: some View {
+    private func buildCalculator(width: CGFloat) -> CGFloat {
         let results = state.calcResults
-        return VStack(alignment: .leading, spacing: 1.5) {
-            if results.isEmpty {
-                HStack(spacing: 6) {
-                    Text(state.calcExpression.isEmpty ? "输入数字或算式，如 128*6+50" : state.calcExpression)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-            } else {
-                ForEach(Array(results.enumerated()), id: \.element.id) { idx, item in
-                    resultRow(index: idx, item: item, showNumber: false, showReturnBadge: true)
-                }
-            }
+        var y: CGFloat = 4.5
+        if results.isEmpty {
+            let label = NSTextField(labelWithString: state.calcExpression.isEmpty ? "输入数字或算式，如 128*6+50" : state.calcExpression)
+            label.font = .systemFont(ofSize: 12.5)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byTruncatingTail
+            label.frame = NSRect(x: 10, y: y + 7, width: width - 20, height: 16)
+            addSubview(label)
+            return y + 30 + 4.5
         }
-        .padding(4.5)
+        for (idx, item) in results.enumerated() {
+            let row = makeResultRow(
+                index: idx,
+                item: item,
+                showNumber: false,
+                showReturnBadge: true,
+                frame: NSRect(x: 4.5, y: y, width: width - 9, height: 27)
+            )
+            addSubview(row)
+            y += 27 + (idx < results.count - 1 ? 1.5 : 0)
+        }
+        return y + 4.5
     }
 
     // MARK: Phrases Sub-Mode
 
-    private var phrasesView: some View {
+    private func buildPhrases(width: CGFloat) -> CGFloat {
         let items = state.phraseItems
-        return VStack(alignment: .leading, spacing: 0) {
-            subHeader(title: "常用语", icon: "shippingbox", hint: "数字键或回车上屏")
-            Divider().opacity(state.isDark ? 0.18 : 0.25)
+        var y = addSubHeader(title: "常用语", icon: "shippingbox", hint: "数字键或回车上屏", width: width)
+        addSubview(makeDivider(y: y, width: width, alpha: state.isDark ? 0.18 : 0.25))
+        y += 1
 
-            if items.isEmpty {
-                HStack {
-                    Text("暂无常用语")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("去设置添加") {
-                        onOpenSettings()
-                    }
-                    .controlSize(.small)
-                }
-                .padding(12)
-            } else {
-                VStack(spacing: 2) {
-                    ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                        resultRow(index: idx, item: item, showNumber: true)
-                    }
-                }
-                .padding(6)
-            }
+        if items.isEmpty {
+            let emptyLabel = NSTextField(labelWithString: "暂无常用语")
+            emptyLabel.font = .systemFont(ofSize: 13)
+            emptyLabel.textColor = .secondaryLabelColor
+            emptyLabel.frame = NSRect(x: 12, y: y + 13, width: 100, height: 18)
+            addSubview(emptyLabel)
+
+            let btn = NSButton(title: "去设置添加", target: self, action: #selector(handleOpenSettings))
+            btn.bezelStyle = .rounded
+            btn.controlSize = .small
+            let bSize = btn.fittingSize
+            btn.frame = NSRect(x: width - 12 - bSize.width, y: y + 10, width: bSize.width, height: bSize.height)
+            addSubview(btn)
+            return y + 44
         }
+
+        y += 6
+        for (idx, item) in items.enumerated() {
+            let row = makeResultRow(index: idx, item: item, showNumber: true, showReturnBadge: false, frame: NSRect(x: 6, y: y, width: width - 12, height: 27))
+            addSubview(row)
+            y += 27 + (idx < items.count - 1 ? 2 : 0)
+        }
+        return y + 6
     }
 
     // MARK: DateTime Sub-Mode
 
-    private var dateTimeView: some View {
+    private func buildDateTime(width: CGFloat) -> CGFloat {
         let items = state.dateTimeItems
-        return VStack(alignment: .leading, spacing: 0) {
-            subHeader(title: "日期时间", icon: "calendar.badge.clock", hint: "数字键或回车上屏")
-            Divider().opacity(state.isDark ? 0.18 : 0.25)
+        var y = addSubHeader(title: "日期时间", icon: "calendar.badge.clock", hint: "数字键或回车上屏", width: width)
+        addSubview(makeDivider(y: y, width: width, alpha: state.isDark ? 0.18 : 0.25))
+        y += 7
 
-            VStack(spacing: 2) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                    resultRow(index: idx, item: item, showNumber: true)
-                }
-            }
-            .padding(6)
+        for (idx, item) in items.enumerated() {
+            let row = makeResultRow(index: idx, item: item, showNumber: true, showReturnBadge: false, frame: NSRect(x: 6, y: y, width: width - 12, height: 27))
+            addSubview(row)
+            y += 27 + (idx < items.count - 1 ? 2 : 0)
         }
+        return y + 6
     }
 
     // MARK: Symbols Sub-Mode
 
-    private var symbolsView: some View {
+    private func buildSymbols(width: CGFloat) -> CGFloat {
+        var y = addSubHeader(title: "符号", icon: "face.smiling", hint: "Tab 切换分类 · 方向键选择", width: width)
+        addSubview(makeDivider(y: y, width: width, alpha: state.isDark ? 0.18 : 0.25))
+        y += 1
+
+        // Horizontal category strip
+        let catScroll = NSScrollView(frame: NSRect(x: 0, y: y, width: width, height: 32))
+        catScroll.hasHorizontalScroller = false
+        catScroll.hasVerticalScroller = false
+        catScroll.drawsBackground = false
+        catScroll.borderType = .noBorder
+
+        let catDoc = VModeFlippedDocumentView()
+        var cx: CGFloat = 8
+        var activeCatRect: NSRect = .zero
+        for cat in VModeSymbolCategory.allCases {
+            let active = (cat == state.symbolCategory)
+            let pill = VModeClickableRowNSView()
+            pill.wantsLayer = true
+            pill.layer?.cornerCurve = .continuous
+            pill.layer?.cornerRadius = 11
+            pill.layer?.backgroundColor = active ? NSColor.controlAccentColor.cgColor : NSColor.clear.cgColor
+            pill.onClick = { [weak self] in
+                self?.state.symbolCategory = cat
+                self?.state.selectedListIndex = 0
+                VModePanelController.shared.updateLayout()
+            }
+
+            let label = NSTextField(labelWithString: cat.title)
+            label.font = .systemFont(ofSize: 12, weight: active ? .semibold : .regular)
+            label.textColor = active ? .white : .secondaryLabelColor
+            label.sizeToFit()
+            let pw = ceil(label.fittingSize.width) + 16
+            pill.frame = NSRect(x: cx, y: 5, width: pw, height: 22)
+            label.frame = NSRect(x: 8, y: 3, width: ceil(label.fittingSize.width), height: 16)
+            pill.addSubview(label)
+            catDoc.addSubview(pill)
+            if active { activeCatRect = pill.frame }
+            cx += pw + 3
+        }
+        catDoc.frame = NSRect(x: 0, y: 0, width: max(width, cx + 5), height: 32)
+        catScroll.documentView = catDoc
+        if !activeCatRect.isEmpty {
+            catDoc.scrollToVisible(activeCatRect.insetBy(dx: -12, dy: 0))
+        }
+        addSubview(catScroll)
+        symbolCategoryScrollView = catScroll
+        y += 32
+
+        addSubview(makeDivider(y: y, width: width, alpha: state.isDark ? 0.18 : 0.25))
+        y += 1
+
+        // 6-column scrollable symbol grid
         let symbols = state.symbolCategory.symbols
-        return VStack(alignment: .leading, spacing: 0) {
-            subHeader(title: "符号", icon: "face.smiling", hint: "Tab 切换分类 · 方向键选择")
-            Divider().opacity(state.isDark ? 0.18 : 0.25)
+        let gridHeight: CGFloat = 196
+        let gridScroll = NSScrollView(frame: NSRect(x: 0, y: y, width: width, height: gridHeight))
+        gridScroll.hasVerticalScroller = true
+        gridScroll.autohidesScrollers = true
+        gridScroll.drawsBackground = false
+        gridScroll.borderType = .noBorder
 
-            ScrollViewReader { tabProxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 3) {
-                        ForEach(VModeSymbolCategory.allCases) { cat in
-                            let active = (cat == state.symbolCategory)
-                            Button {
-                                state.symbolCategory = cat
-                                state.selectedListIndex = 0
-                            } label: {
-                                Text(cat.title)
-                                    .font(.system(size: 12, weight: active ? .semibold : .regular))
-                                    .foregroundStyle(active ? Color.white : Color.secondary)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 3.5)
-                                    .background(
-                                        Capsule()
-                                            .fill(active ? highlightColor : Color.clear)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .id(cat)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                }
-                .onChange(of: state.symbolCategory) { newCat in
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        tabProxy.scrollTo(newCat, anchor: .center)
-                    }
-                }
-            }
+        let cols = 6
+        let pad: CGFloat = 8
+        let gap: CGFloat = 4
+        let cellW = floor((width - pad * 2 - gap * CGFloat(cols - 1)) / CGFloat(cols))
+        let cellH: CGFloat = 32
+        let rows = (symbols.count + cols - 1) / cols
+        let docH = pad * 2 + CGFloat(rows) * cellH + CGFloat(max(0, rows - 1)) * gap
 
-            Divider().opacity(state.isDark ? 0.18 : 0.25)
+        let gridDoc = VModeFlippedDocumentView(frame: NSRect(x: 0, y: 0, width: width, height: max(gridHeight, docH)))
+        var selectedRect: NSRect = .zero
+        for (idx, sym) in symbols.enumerated() {
+            let r = idx / cols
+            let c = idx % cols
+            let x = pad + CGFloat(c) * (cellW + gap)
+            let cy = pad + CGFloat(r) * (cellH + gap)
+            let isSelected = (state.selectedListIndex == idx)
 
-            ScrollViewReader { gridProxy in
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 6), spacing: 4) {
-                        ForEach(Array(symbols.enumerated()), id: \.offset) { idx, sym in
-                            let isSelected = (state.selectedListIndex == idx)
-                            Button {
-                                onCommitText(sym)
-                            } label: {
-                                Text(sym)
-                                    .font(.system(size: 16))
-                                    .foregroundStyle(isSelected ? Color.white : Color.primary)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 32)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                            .fill(isSelected ? highlightColor : Color.primary.opacity(0.05))
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .id(idx)
-                        }
-                    }
-                    .padding(8)
-                }
-                .frame(height: 196)
-                .onChange(of: state.selectedListIndex) { newIdx in
-                    gridProxy.scrollTo(newIdx, anchor: .center)
-                }
-                .onChange(of: state.symbolCategory) { _ in
-                    gridProxy.scrollTo(0, anchor: .top)
-                }
-            }
+            let cell = VModeClickableRowNSView(frame: NSRect(x: x, y: cy, width: cellW, height: cellH))
+            cell.wantsLayer = true
+            cell.layer?.cornerCurve = .continuous
+            cell.layer?.cornerRadius = 7
+            cell.layer?.backgroundColor = isSelected
+                ? NSColor.controlAccentColor.cgColor
+                : NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            cell.onClick = { [weak self] in self?.onCommitText(sym) }
+
+            let lbl = NSTextField(labelWithString: sym)
+            lbl.font = .systemFont(ofSize: 16)
+            lbl.alignment = .center
+            lbl.textColor = isSelected ? .white : .labelColor
+            lbl.frame = NSRect(x: 0, y: 6, width: cellW, height: 20)
+            cell.addSubview(lbl)
+            gridDoc.addSubview(cell)
+            if isSelected { selectedRect = cell.frame }
         }
+        gridScroll.documentView = gridDoc
+        if !selectedRect.isEmpty {
+            gridDoc.scrollToVisible(selectedRect.insetBy(dx: 0, dy: -16))
+        }
+        addSubview(gridScroll)
+        symbolGridScrollView = gridScroll
+        lastSymbolCategory = state.symbolCategory
+        return y + gridHeight
     }
 
-    // MARK: Shared Subview Helpers
+    // MARK: Shared Subviews
 
-    private func subHeader(title: String, icon: String, hint: String) -> some View {
-        HStack(spacing: 6) {
-            Button {
-                onBackToMenu()
-            } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 20)
-            }
-            .buttonStyle(.plain)
+    private func addSubHeader(title: String, icon: String, hint: String, width: CGFloat) -> CGFloat {
+        let headerH: CGFloat = 34
+        let backBtn = VModeClickableRowNSView(frame: NSRect(x: 10, y: 7, width: 20, height: 20))
+        backBtn.onClick = { [weak self] in self?.onBackToMenu() }
+        let chev = NSImageView(frame: NSRect(x: 4, y: 4, width: 12, height: 12))
+        let chevCfg = NSImage.SymbolConfiguration(pointSize: 11.5, weight: .semibold)
+        chev.image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: nil)?.withSymbolConfiguration(chevCfg)
+        chev.contentTintColor = .secondaryLabelColor
+        backBtn.addSubview(chev)
+        addSubview(backBtn)
 
-            Image(systemName: icon)
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(.secondary)
+        let iconView = NSImageView(frame: NSRect(x: 34, y: 9.5, width: 15, height: 15))
+        let iconCfg = NSImage.SymbolConfiguration(pointSize: 12.5, weight: .medium)
+        iconView.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)?.withSymbolConfiguration(iconCfg)
+        iconView.contentTintColor = .secondaryLabelColor
+        addSubview(iconView)
 
-            Text(title)
-                .font(.system(size: 13.5, weight: .semibold))
+        let titleLbl = NSTextField(labelWithString: title)
+        titleLbl.font = .systemFont(ofSize: 13.5, weight: .semibold)
+        titleLbl.textColor = .labelColor
+        titleLbl.sizeToFit()
+        titleLbl.frame = NSRect(x: 54, y: 8.5, width: ceil(titleLbl.fittingSize.width), height: 17)
+        addSubview(titleLbl)
 
-            Spacer()
+        let hintLbl = NSTextField(labelWithString: hint)
+        hintLbl.font = .systemFont(ofSize: 11)
+        hintLbl.textColor = .secondaryLabelColor
+        hintLbl.alignment = .right
+        hintLbl.sizeToFit()
+        let hw = ceil(hintLbl.fittingSize.width)
+        hintLbl.frame = NSRect(x: width - 10 - hw, y: 10, width: hw, height: 14)
+        addSubview(hintLbl)
 
-            Text(hint)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        return headerH
     }
 
-    private func resultRow(index: Int, item: VModeResultItem, showNumber: Bool, showReturnBadge: Bool = false) -> some View {
+    private func makeResultRow(index: Int, item: VModeResultItem, showNumber: Bool, showReturnBadge: Bool, frame: NSRect) -> NSView {
         let isSelected = (state.selectedListIndex == index)
-        return Button {
-            onCommitText(item.value)
-        } label: {
-            HStack(spacing: 6) {
-                if showNumber {
-                    Text("\(index + 1)")
-                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(isSelected ? Color.white.opacity(0.95) : Color.secondary)
-                        .frame(width: 12, alignment: .center)
-                }
-                Text(item.value)
-                    .font(.system(size: 13, weight: isSelected ? .medium : .regular))
-                    .foregroundStyle(isSelected ? Color.white : Color.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 4)
-                if let sub = item.subtitle {
-                    Text(sub)
-                        .font(.system(size: 11))
-                        .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
-                        .lineLimit(1)
-                }
-                if showReturnBadge && isSelected {
-                    Text("↵")
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.92))
-                        .frame(width: 17, height: 17)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(Color.white.opacity(0.20))
-                        )
-                }
+        let row = VModeClickableRowNSView(frame: frame)
+        row.wantsLayer = true
+        row.layer?.cornerCurve = .continuous
+        row.layer?.cornerRadius = 6
+        row.layer?.backgroundColor = isSelected ? NSColor.controlAccentColor.cgColor : NSColor.clear.cgColor
+        row.onClick = { [weak self] in self?.onCommitText(item.value) }
+
+        var x: CGFloat = 8
+        if showNumber {
+            let num = NSTextField(labelWithString: "\(index + 1)")
+            let base = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+            if let desc = base.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: desc, size: 11.5) {
+                num.font = f
+            } else {
+                num.font = base
             }
-            .padding(.horizontal, 8)
-            .frame(height: 27)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isSelected ? highlightColor : Color.clear)
-            )
-            .contentShape(Rectangle())
+            num.alignment = .center
+            num.textColor = isSelected ? NSColor.white.withAlphaComponent(0.95) : .secondaryLabelColor
+            num.frame = NSRect(x: x, y: 6, width: 12, height: 15)
+            row.addSubview(num)
+            x += 18
         }
-        .buttonStyle(.plain)
+
+        var rightEdge = frame.width - 8
+        if showReturnBadge && isSelected {
+            let badge = NSView(frame: NSRect(x: rightEdge - 17, y: 5, width: 17, height: 17))
+            badge.wantsLayer = true
+            badge.layer?.cornerCurve = .continuous
+            badge.layer?.cornerRadius = 4
+            badge.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.20).cgColor
+            let ret = NSTextField(labelWithString: "↵")
+            ret.font = .systemFont(ofSize: 10, weight: .medium)
+            ret.alignment = .center
+            ret.textColor = NSColor.white.withAlphaComponent(0.92)
+            ret.frame = NSRect(x: 0, y: 1.5, width: 17, height: 14)
+            badge.addSubview(ret)
+            row.addSubview(badge)
+            rightEdge -= 23
+        }
+
+        if let sub = item.subtitle, !sub.isEmpty {
+            let subLbl = NSTextField(labelWithString: sub)
+            subLbl.font = .systemFont(ofSize: 11)
+            subLbl.textColor = isSelected ? NSColor.white.withAlphaComponent(0.80) : .secondaryLabelColor
+            subLbl.lineBreakMode = .byTruncatingTail
+            let sw = min(84, ceil(subLbl.fittingSize.width))
+            subLbl.frame = NSRect(x: rightEdge - sw, y: 6.5, width: sw, height: 14)
+            row.addSubview(subLbl)
+            rightEdge -= (sw + 6)
+        }
+
+        let valLbl = NSTextField(labelWithString: item.value)
+        valLbl.font = .systemFont(ofSize: 13, weight: isSelected ? .medium : .regular)
+        valLbl.textColor = isSelected ? .white : .labelColor
+        valLbl.lineBreakMode = .byTruncatingTail
+        valLbl.frame = NSRect(x: x, y: 5.5, width: max(20, rightEdge - x), height: 16)
+        row.addSubview(valLbl)
+
+        return row
+    }
+
+    private func makeDivider(y: CGFloat, width: CGFloat, alpha: CGFloat) -> NSView {
+        let div = NSView(frame: NSRect(x: 0, y: y, width: width, height: 1))
+        div.wantsLayer = true
+        div.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(alpha).cgColor
+        return div
+    }
+
+    @objc private func handleOpenSettings() {
+        onOpenSettings()
     }
 }
 
@@ -945,18 +1058,19 @@ final class VModePanelController {
     var onDismiss: (() -> Void)?
 
     private let panel: NSPanel
-    private let hostingView: NSHostingView<VModePopupView>
+    private let contentNSView: VModeContentNSView
     private var glassContainerView: NSView?
     private var fallbackEffectView: NSVisualEffectView?
     private var lastAnchorRect: NSRect?
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
+    private var cancellables: Set<AnyCancellable> = []
 
     var isVisible: Bool { panel.isVisible }
 
     private init() {
         let p = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: 254, height: 180),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -971,28 +1085,17 @@ final class VModePanelController {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
         self.panel = p
 
-        let stateRef = self.state
-        let host = NSHostingView(rootView: VModePopupView(
-            state: stateRef,
-            onSelectMenuItem: { item in
-                VModePanelController.shared.onSelectMenuItem?(item)
-            },
-            onCommitText: { text in
-                VModePanelController.shared.onCommitText?(text)
-            },
-            onBackToMenu: {
-                VModePanelController.shared.onBackToMenu?()
-            },
-            onOpenSettings: {
-                VModePanelController.shared.onSelectMenuItem?(.settings)
-            }
-        ))
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
-        host.layer?.cornerCurve = .continuous
-        host.layer?.cornerRadius = 14
-        host.layer?.masksToBounds = true
-        host.autoresizingMask = [.width, .height]
+        let view = VModeContentNSView(
+            state: state,
+            onSelectMenuItem: { item in VModePanelController.shared.onSelectMenuItem?(item) },
+            onCommitText: { text in VModePanelController.shared.onCommitText?(text) },
+            onBackToMenu: { VModePanelController.shared.onBackToMenu?() },
+            onOpenSettings: { VModePanelController.shared.onSelectMenuItem?(.settings) }
+        )
+        view.layer?.cornerCurve = .continuous
+        view.layer?.cornerRadius = 14
+        view.layer?.masksToBounds = true
+        view.autoresizingMask = [.width, .height]
 
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
@@ -1003,7 +1106,7 @@ final class VModePanelController {
             glass.layer?.cornerCurve = .continuous
             glass.layer?.cornerRadius = 14
             glass.layer?.masksToBounds = true
-            glass.contentView = host
+            glass.contentView = view
             p.contentView = glass
             self.glassContainerView = glass
         } else {
@@ -1015,32 +1118,41 @@ final class VModePanelController {
             effect.layer?.masksToBounds = true
             effect.layer?.cornerCurve = .continuous
             effect.layer?.cornerRadius = 14
-            host.translatesAutoresizingMaskIntoConstraints = false
-            effect.addSubview(host)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(view)
             NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-                host.topAnchor.constraint(equalTo: effect.topAnchor),
-                host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+                view.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                view.topAnchor.constraint(equalTo: effect.topAnchor),
+                view.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
             ])
             p.contentView = effect
             self.fallbackEffectView = effect
         }
 
-        self.hostingView = host
+        self.contentNSView = view
+        state.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.panel.isVisible else { return }
+                self.contentNSView.rebuild()
+                self.positionPanel(anchorRect: self.lastAnchorRect)
+            }
+            .store(in: &cancellables)
     }
 
     func show(near anchorRect: NSRect?, isDark: Bool) {
         state.isDark = isDark
         let appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
         panel.appearance = appearance
-        hostingView.appearance = appearance
+        contentNSView.appearance = appearance
         if #available(macOS 26.0, *), let glass = glassContainerView as? NSGlassEffectView {
             glass.appearance = appearance
         } else if let effect = fallbackEffectView {
             effect.appearance = appearance
         }
         lastAnchorRect = anchorRect
+        contentNSView.rebuild()
         positionPanel(anchorRect: anchorRect)
         panel.orderFrontRegardless()
         installOutsideClickMonitor()
@@ -1054,11 +1166,8 @@ final class VModePanelController {
 
     func updateLayout() {
         guard panel.isVisible else { return }
+        contentNSView.rebuild()
         positionPanel(anchorRect: lastAnchorRect)
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.panel.isVisible else { return }
-            self.positionPanel(anchorRect: self.lastAnchorRect)
-        }
     }
 
     func hide() {
@@ -1099,8 +1208,7 @@ final class VModePanelController {
     }
 
     private func positionPanel(anchorRect: NSRect?) {
-        hostingView.layoutSubtreeIfNeeded()
-        let size = hostingView.fittingSize
+        let size = contentNSView.preferredSize()
         guard size.width > 0 && size.height > 0 else { return }
 
         let mouse = NSEvent.mouseLocation

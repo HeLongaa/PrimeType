@@ -1,54 +1,69 @@
 import Cocoa
-import SwiftUI
+import Combine
+import QuartzCore
 
-// MARK: - Channel Icon
+// MARK: - Pure AppKit Channel Icon View
 
-struct VoiceChannelIconView: View {
-    let channel: VoiceCloudChannel?
-    var isError: Bool = false
-    var size: CGFloat = 22
-    var cornerRadius: CGFloat = 6
+private final class VoiceChannelIconNSView: NSView {
+    private let imageView = NSImageView()
+    private let fallbackSymbolView = NSImageView()
+    private var currentIsError = false
+    private var currentChannel: VoiceCloudChannel?
 
-    var body: some View {
-        Group {
-            if isError {
-                ZStack {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color(red: 0.88, green: 0.27, blue: 0.32))
-                    Image(systemName: "exclamationmark")
-                        .font(.system(size: round(size * 0.52), weight: .bold))
-                        .foregroundStyle(.white)
-                }
-            } else if let channel, let nsImage = NSImage(named: channel.iconAssetName) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .frame(width: size, height: size)
-                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            } else {
-                ZStack {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.accentColor)
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: round(size * 0.50), weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-            }
+    init(size: CGFloat = 22, cornerRadius: CGFloat = 6) {
+        super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
+        wantsLayer = true
+        layer?.cornerCurve = .continuous
+        layer?.cornerRadius = cornerRadius
+        layer?.masksToBounds = true
+
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.frame = bounds
+        imageView.autoresizingMask = [.width, .height]
+        addSubview(imageView)
+
+        fallbackSymbolView.imageScaling = .scaleProportionallyDown
+        fallbackSymbolView.contentTintColor = .white
+        let inset = round(size * 0.22)
+        fallbackSymbolView.frame = bounds.insetBy(dx: inset, dy: inset)
+        fallbackSymbolView.autoresizingMask = [.width, .height]
+        addSubview(fallbackSymbolView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(channel: VoiceCloudChannel?, isError: Bool) {
+        currentChannel = channel
+        currentIsError = isError
+        if isError {
+            imageView.isHidden = true
+            fallbackSymbolView.isHidden = false
+            layer?.backgroundColor = NSColor(calibratedRed: 0.88, green: 0.27, blue: 0.32, alpha: 1.0).cgColor
+            let cfg = NSImage.SymbolConfiguration(pointSize: round(bounds.height * 0.50), weight: .bold)
+            fallbackSymbolView.image = NSImage(systemSymbolName: "exclamationmark", accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg)
+        } else if let channel, let nsImage = NSImage(named: channel.iconAssetName) {
+            imageView.isHidden = false
+            fallbackSymbolView.isHidden = true
+            layer?.backgroundColor = NSColor.clear.cgColor
+            imageView.image = nsImage
+        } else {
+            imageView.isHidden = true
+            fallbackSymbolView.isHidden = false
+            layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            let cfg = NSImage.SymbolConfiguration(pointSize: round(bounds.height * 0.48), weight: .semibold)
+            fallbackSymbolView.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg)
         }
-        .frame(width: size, height: size)
     }
 }
 
-// MARK: - Audio Level Spectrum Visualizer
+// MARK: - Pure AppKit Spectrum Waveform View (Zero SwiftUI)
 
-private struct VoiceWaveView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    var level: CGFloat
-    var paused: Bool = false
-    var width: CGFloat = 120
-    var height: CGFloat = 30
-
+private final class VoiceWaveNSView: NSView {
     private static let barCount = 13
     private static let barWeights: [CGFloat] = [
         0.34, 0.48, 0.64, 0.78, 0.90, 0.98, 1.00, 0.98, 0.90, 0.78, 0.64, 0.48, 0.34
@@ -56,27 +71,39 @@ private struct VoiceWaveView: View {
     private static let barPhases: [CGFloat] = [
         0.0, 0.7, 1.4, 2.1, 2.8, 3.5, 4.2, 4.9, 5.6, 6.3, 7.0, 7.7, 8.4
     ]
-
-    // Luminous Apple-Intelligence-inspired iridescent stops (wraps smoothly)
     private static let darkPalette: [(CGFloat, CGFloat, CGFloat)] = [
-        (0.22, 0.74, 0.98), // Sky Cyan
-        (0.38, 0.65, 1.00), // Electric Blue
-        (0.65, 0.55, 0.98), // Soft Violet
-        (0.96, 0.45, 0.71), // Vivid Pink
-        (0.99, 0.50, 0.44), // Warm Coral
-        (0.98, 0.75, 0.24)  // Luminous Amber
+        (0.22, 0.74, 0.98), (0.38, 0.65, 1.00), (0.65, 0.55, 0.98),
+        (0.96, 0.45, 0.71), (0.99, 0.50, 0.44), (0.98, 0.75, 0.24)
     ]
-
     private static let lightPalette: [(CGFloat, CGFloat, CGFloat)] = [
-        (0.01, 0.52, 0.78), // Deep Sky
-        (0.15, 0.39, 0.92), // Cobalt Blue
-        (0.49, 0.23, 0.93), // Rich Violet
-        (0.86, 0.15, 0.47), // Vivid Magenta
-        (0.88, 0.16, 0.28), // Rose Coral
-        (0.85, 0.47, 0.02)  // Rich Amber
+        (0.01, 0.52, 0.78), (0.15, 0.39, 0.92), (0.49, 0.23, 0.93),
+        (0.86, 0.15, 0.47), (0.88, 0.16, 0.28), (0.85, 0.47, 0.02)
     ]
 
-    private static func sampledColor(at position: CGFloat, isDark: Bool, opacity: CGFloat) -> Color {
+    var smoothedLevel: CGFloat = 0
+    private var animTimer: Timer?
+
+    override var isOpaque: Bool { false }
+
+    func setAnimating(_ running: Bool) {
+        if running {
+            guard animTimer == nil else { return }
+            let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                self?.needsDisplay = true
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            animTimer = timer
+        } else {
+            animTimer?.invalidate()
+            animTimer = nil
+        }
+    }
+
+    deinit {
+        animTimer?.invalidate()
+    }
+
+    private static func sampledColor(at position: CGFloat, isDark: Bool, opacity: CGFloat) -> NSColor {
         let palette = isDark ? darkPalette : lightPalette
         let n = palette.count
         var wrapped = position.truncatingRemainder(dividingBy: 1.0)
@@ -87,184 +114,286 @@ private struct VoiceWaveView: View {
         let frac = scaled - floor(scaled)
         let c0 = palette[idx0]
         let c1 = palette[idx1]
-        return Color(
-            red: c0.0 + (c1.0 - c0.0) * frac,
+        return NSColor(
+            srgbRed: c0.0 + (c1.0 - c0.0) * frac,
             green: c0.1 + (c1.1 - c0.1) * frac,
-            blue: c0.2 + (c1.2 - c0.2) * frac
-        ).opacity(opacity)
+            blue: c0.2 + (c1.2 - c0.2) * frac,
+            alpha: opacity
+        )
     }
 
-    var body: some View {
-        let isDark = (colorScheme == .dark)
-        TimelineView(.animation(paused: paused)) { context in
-            let t = CGFloat(context.date.timeIntervalSinceReferenceDate)
-            Canvas { ctx, size in
-                let count = Self.barCount
-                let spacing: CGFloat = 4.5
-                let totalSpacing = spacing * CGFloat(count - 1)
-                let barWidth = max(2.5, min(3.2, (size.width - totalSpacing) / CGFloat(count)))
-                let contentWidth = CGFloat(count) * barWidth + totalSpacing
-                let startX = (size.width - contentWidth) * 0.5
-                let minBarHeight: CGFloat = 4.5
-                let maxBarHeight = max(minBarHeight, size.height - 4.0)
-                let clampedLevel = max(0, min(1, level))
-                let colorShift = t * 0.22
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let t = CGFloat(Date.timeIntervalSinceReferenceDate)
+        let count = Self.barCount
+        let spacing: CGFloat = 4.5
+        let totalSpacing = spacing * CGFloat(count - 1)
+        let barWidth = max(2.5, min(3.2, (bounds.width - totalSpacing) / CGFloat(count)))
+        let contentWidth = CGFloat(count) * barWidth + totalSpacing
+        let startX = (bounds.width - contentWidth) * 0.5
+        let minBarHeight: CGFloat = 4.5
+        let maxBarHeight = max(minBarHeight, bounds.height - 4.0)
+        let clampedLevel = max(0, min(1, smoothedLevel))
+        let colorShift = t * 0.22
+        let cs = CGColorSpaceCreateDeviceRGB()
 
-                for i in 0..<count {
-                    let weight = Self.barWeights[i]
-                    let phase = Self.barPhases[i]
+        for i in 0..<count {
+            let weight = Self.barWeights[i]
+            let phase = Self.barPhases[i]
+            let rippleA = 0.5 + 0.5 * sin(t * 6.8 + phase)
+            let rippleB = 0.5 + 0.5 * cos(t * 4.1 - phase * 0.7)
+            let organic = 0.55 + 0.45 * (rippleA * 0.6 + rippleB * 0.4)
+            let energy = pow(clampedLevel, 0.82)
+            let active = (0.10 + energy * 0.90) * organic * weight
+            let normalizedHeight = max(0.06, min(1.0, active))
 
-                    let rippleA = 0.5 + 0.5 * sin(t * 6.8 + phase)
-                    let rippleB = 0.5 + 0.5 * cos(t * 4.1 - phase * 0.7)
-                    let organic = 0.55 + 0.45 * (rippleA * 0.6 + rippleB * 0.4)
-                    let energy = pow(clampedLevel, 0.82)
-                    let active = (0.10 + energy * 0.90) * organic * weight
-                    let normalizedHeight = max(0.06, min(1.0, active))
+            let barHeight = minBarHeight + (maxBarHeight - minBarHeight) * normalizedHeight
+            let x = startX + CGFloat(i) * (barWidth + spacing)
+            let y = (bounds.height - barHeight) * 0.5
+            let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
+            let path = CGPath(roundedRect: rect, cornerWidth: barWidth * 0.5, cornerHeight: barWidth * 0.5, transform: nil)
 
-                    let barHeight = minBarHeight + (maxBarHeight - minBarHeight) * normalizedHeight
-                    let x = startX + CGFloat(i) * (barWidth + spacing)
-                    let y = (size.height - barHeight) * 0.5
-                    let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
-                    let pill = Path(roundedRect: rect, cornerRadius: barWidth * 0.5)
+            let u = CGFloat(i) / CGFloat(max(1, count - 1))
+            let barOpacity = 0.82 + 0.18 * normalizedHeight
+            let topColor = Self.sampledColor(at: u * 0.85 + colorShift, isDark: isDark, opacity: barOpacity).cgColor
+            let bottomColor = Self.sampledColor(at: u * 0.85 + colorShift + 0.10, isDark: isDark, opacity: barOpacity * 0.92).cgColor
 
-                    let u = CGFloat(i) / CGFloat(max(1, count - 1))
-                    let barOpacity = 0.82 + 0.18 * normalizedHeight
-                    let topColor = Self.sampledColor(at: u * 0.85 + colorShift, isDark: isDark, opacity: barOpacity)
-                    let bottomColor = Self.sampledColor(at: u * 0.85 + colorShift + 0.10, isDark: isDark, opacity: barOpacity * 0.92)
-                    ctx.fill(
-                        pill,
-                        with: .linearGradient(
-                            Gradient(colors: [topColor, bottomColor]),
-                            startPoint: CGPoint(x: rect.midX, y: rect.minY),
-                            endPoint: CGPoint(x: rect.midX, y: rect.maxY)
-                        )
-                    )
-                }
+            ctx.saveGState()
+            ctx.addPath(path)
+            ctx.clip()
+            if let grad = CGGradient(colorsSpace: cs, colors: [bottomColor, topColor] as CFArray, locations: [0.0, 1.0]) {
+                ctx.drawLinearGradient(
+                    grad,
+                    start: CGPoint(x: rect.midX, y: rect.minY),
+                    end: CGPoint(x: rect.midX, y: rect.maxY),
+                    options: []
+                )
             }
+            ctx.restoreGState()
         }
-        .frame(width: width, height: height)
     }
 }
 
-// MARK: - Activity Indicator
+// MARK: - Pure AppKit Gradient Spinner View
 
-private struct VoiceWaitSpinnerView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    var size: CGFloat = 14
-    var lineWidth: CGFloat = 2.0
-    var paused: Bool = false
+private final class VoiceSpinnerNSView: NSView {
+    var lineWidth: CGFloat = 1.9
+    private var animTimer: Timer?
 
-    var body: some View {
-        let isDark = (colorScheme == .dark)
-        TimelineView(.animation(paused: paused)) { context in
-            let angle = Angle.degrees(
-                context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.85) / 0.85 * 360.0
+    override var isOpaque: Bool { false }
+
+    func setAnimating(_ running: Bool) {
+        if running {
+            guard animTimer == nil else { return }
+            let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                self?.needsDisplay = true
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            animTimer = timer
+        } else {
+            animTimer?.invalidate()
+            animTimer = nil
+        }
+    }
+
+    deinit {
+        animTimer?.invalidate()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let radius = (min(bounds.width, bounds.height) - lineWidth) * 0.5
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+
+        ctx.setLineWidth(lineWidth)
+        ctx.setLineCap(.round)
+        ctx.setStrokeColor(NSColor.labelColor.withAlphaComponent(isDark ? 0.20 : 0.14).cgColor)
+        ctx.addArc(center: center, radius: radius, startAngle: 0, endAngle: .pi * 2, clockwise: false)
+        ctx.strokePath()
+
+        let phase = Date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.85) / 0.85
+        let startAngle = CGFloat(-phase * 2.0 * .pi)
+        let endAngle = startAngle - CGFloat(0.36 * 2.0 * .pi)
+        let accent = isDark
+            ? NSColor(srgbRed: 0.45, green: 0.65, blue: 0.98, alpha: 1.0)
+            : NSColor(srgbRed: 0.20, green: 0.45, blue: 0.92, alpha: 1.0)
+        ctx.setStrokeColor(accent.cgColor)
+        ctx.addArc(center: center, radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: true)
+        ctx.strokePath()
+    }
+}
+
+// MARK: - Pure AppKit HUD Content View
+
+private final class VoiceHUDContentNSView: NSView {
+    private let iconView = VoiceChannelIconNSView(size: 22, cornerRadius: 6)
+    private let waveView = VoiceWaveNSView(frame: NSRect(x: 0, y: 0, width: 112, height: 26))
+    private let waitSpinner = VoiceSpinnerNSView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+    private let waitLabel = NSTextField(labelWithString: "启动麦克风…")
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let recognizingSpinner = VoiceSpinnerNSView(frame: NSRect(x: 0, y: 0, width: 14, height: 14))
+
+    private var smoothedLevel: CGFloat = 0
+    private var isVisibleHUD = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        waitLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        waitLabel.textColor = NSColor.labelColor.withAlphaComponent(0.86)
+        waitLabel.lineBreakMode = .byTruncatingTail
+        waitSpinner.lineWidth = 1.8
+
+        statusLabel.font = .systemFont(ofSize: 12.5, weight: .medium)
+        statusLabel.textColor = .labelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 1
+        recognizingSpinner.lineWidth = 2.0
+
+        addSubview(iconView)
+        addSubview(waveView)
+        addSubview(waitSpinner)
+        addSubview(waitLabel)
+        addSubview(statusLabel)
+        addSubview(recognizingSpinner)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setHUDVisible(_ visible: Bool) {
+        isVisibleHUD = visible
+        refresh(from: VoiceInputManager.shared)
+    }
+
+    func updateAudioLevel(_ raw: Float) {
+        let v = CGFloat(raw)
+        smoothedLevel = v > smoothedLevel
+            ? (smoothedLevel * 0.3 + v * 0.7)
+            : (smoothedLevel * 0.85 + v * 0.15)
+        waveView.smoothedLevel = smoothedLevel
+    }
+
+    func refresh(from manager: VoiceInputManager) {
+        iconView.update(channel: manager.activeChannel, isError: manager.isErrorState)
+
+        let showWave = manager.isRecording && manager.isMicReady
+        let showMicWarmup = manager.isRecording && !manager.isMicReady
+        let showError = manager.isErrorState && !manager.statusText.isEmpty
+        let showRecognizing = !showError && manager.isRecognizing
+
+        waveView.isHidden = !showWave
+        waitSpinner.isHidden = !showMicWarmup
+        waitLabel.isHidden = !showMicWarmup
+
+        if showError {
+            statusLabel.isHidden = false
+            statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+            statusLabel.textColor = .labelColor
+            statusLabel.stringValue = manager.statusText
+            recognizingSpinner.isHidden = true
+        } else if showRecognizing {
+            statusLabel.isHidden = false
+            statusLabel.font = .systemFont(ofSize: 12.5, weight: .medium)
+            statusLabel.textColor = NSColor.labelColor.withAlphaComponent(0.88)
+            statusLabel.stringValue = "识别中…"
+            recognizingSpinner.isHidden = false
+        } else {
+            statusLabel.isHidden = true
+            recognizingSpinner.isHidden = true
+        }
+
+        waveView.setAnimating(isVisibleHUD && showWave)
+        waitSpinner.setAnimating(isVisibleHUD && showMicWarmup)
+        recognizingSpinner.setAnimating(isVisibleHUD && showRecognizing)
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    func preferredSize() -> NSSize {
+        let height: CGFloat = 44
+        var x: CGFloat = 11 + 22 // leading + icon
+
+        if !waveView.isHidden {
+            x += 11 + 112
+        } else if !waitLabel.isHidden {
+            x += 11 + 112
+        }
+
+        if !statusLabel.isHidden {
+            let textW = min(420, ceil(statusLabel.fittingSize.width))
+            x += 11 + textW
+            if !recognizingSpinner.isHidden {
+                x += 11 + 14
+            }
+        }
+        x += 16 // trailing
+        return NSSize(width: max(x, 60), height: height)
+    }
+
+    override func layout() {
+        super.layout()
+        let midY = bounds.height * 0.5
+        var x: CGFloat = 11
+
+        iconView.frame = NSRect(x: x, y: round(midY - 11), width: 22, height: 22)
+        x += 22
+
+        if !waveView.isHidden {
+            x += 11
+            waveView.frame = NSRect(x: x, y: round(midY - 13), width: 112, height: 26)
+            x += 112
+        } else if !waitLabel.isHidden {
+            x += 11
+            let labelSize = waitLabel.fittingSize
+            let groupWidth = 12 + 6 + ceil(labelSize.width)
+            let groupStart = x + round(max(0, 112 - groupWidth) * 0.5)
+            waitSpinner.frame = NSRect(x: groupStart, y: round(midY - 6), width: 12, height: 12)
+            waitLabel.frame = NSRect(
+                x: groupStart + 18,
+                y: round(midY - labelSize.height * 0.5),
+                width: ceil(labelSize.width),
+                height: ceil(labelSize.height)
             )
-            ZStack {
-                Circle()
-                    .stroke(Color.primary.opacity(isDark ? 0.20 : 0.14), lineWidth: lineWidth)
-                Circle()
-                    .trim(from: 0, to: 0.34)
-                    .stroke(
-                        LinearGradient(
-                            colors: isDark
-                                ? [Color(red: 0.22, green: 0.74, blue: 0.98), Color(red: 0.65, green: 0.55, blue: 0.98), Color(red: 0.96, green: 0.45, blue: 0.71)]
-                                : [Color(red: 0.01, green: 0.52, blue: 0.78), Color(red: 0.49, green: 0.23, blue: 0.93), Color(red: 0.86, green: 0.15, blue: 0.47)],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ),
-                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
-                    )
-                    .rotationEffect(angle)
-            }
-            .frame(width: size, height: size)
+            x += 112
         }
-    }
-}
 
-// MARK: - HUD Visibility State
-
-private final class VoiceHUDVisibilityState: ObservableObject {
-    @Published var isVisible: Bool = false
-}
-
-// MARK: - HUD Root Content View
-
-private struct VoiceHUDContentView: View {
-    @ObservedObject var manager = VoiceInputManager.shared
-    @ObservedObject var visibilityState: VoiceHUDVisibilityState
-    @State private var smoothedLevel: CGFloat = 0
-
-    var body: some View {
-        singleChannelCapsule
-            .onChange(of: manager.audioLevel) { _, raw in
-                let v = CGFloat(raw)
-                smoothedLevel = v > smoothedLevel
-                    ? (smoothedLevel * 0.3 + v * 0.7)
-                    : (smoothedLevel * 0.85 + v * 0.15)
-            }
-    }
-
-    // Compact floating voice status capsule (hosted inside single native NSGlassEffectView)
-    private var singleChannelCapsule: some View {
-        let paused = !visibilityState.isVisible
-        return HStack(spacing: 11) {
-            VoiceChannelIconView(
-                channel: manager.activeChannel,
-                isError: manager.isErrorState,
-                size: 22,
-                cornerRadius: 6
+        if !statusLabel.isHidden {
+            x += 11
+            let s = statusLabel.fittingSize
+            let textW = min(420, ceil(s.width))
+            statusLabel.frame = NSRect(
+                x: x,
+                y: round(midY - s.height * 0.5),
+                width: textW,
+                height: ceil(s.height)
             )
-
-            if manager.isRecording {
-                if manager.isMicReady {
-                    VoiceWaveView(
-                        level: smoothedLevel,
-                        paused: paused,
-                        width: 112,
-                        height: 26
-                    )
-                } else {
-                    HStack(spacing: 6) {
-                        VoiceWaitSpinnerView(size: 12, lineWidth: 1.8, paused: paused)
-                        Text("启动麦克风…")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.primary.opacity(0.86))
-                    }
-                    .frame(width: 112, height: 26)
-                }
-            }
-
-            if manager.isErrorState && !manager.statusText.isEmpty {
-                Text(manager.statusText)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 420, alignment: .leading)
-            } else if manager.isRecognizing {
-                Text("识别中…")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(.primary.opacity(0.88))
-                VoiceWaitSpinnerView(size: 14, lineWidth: 2.0, paused: paused)
+            x += textW
+            if !recognizingSpinner.isHidden {
+                x += 11
+                recognizingSpinner.frame = NSRect(x: x, y: round(midY - 7), width: 14, height: 14)
             }
         }
-        .padding(.leading, 11)
-        .padding(.trailing, 16)
-        .frame(height: 44)
-        .fixedSize()
     }
 }
+
+// MARK: - VoiceHUDController
 
 final class VoiceHUDController {
     static let shared = VoiceHUDController()
 
     private let panel: NSPanel
-    private let visibilityState = VoiceHUDVisibilityState()
-    private let hostingView: NSHostingView<VoiceHUDContentView>
+    private let contentNSView: VoiceHUDContentNSView
     private var glassContainerView: NSView?
     private var fallbackEffectView: NSVisualEffectView?
     private var hideWorkItem: DispatchWorkItem?
+    private var cancellables: Set<AnyCancellable> = []
 
     private init() {
         let p = NSPanel(
@@ -282,13 +411,11 @@ final class VoiceHUDController {
         p.hidesOnDeactivate = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
 
-        let host = NSHostingView(rootView: VoiceHUDContentView(visibilityState: visibilityState))
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
-        host.layer?.cornerCurve = .continuous
-        host.layer?.cornerRadius = 22
-        host.layer?.masksToBounds = true
-        host.autoresizingMask = [.width, .height]
+        let view = VoiceHUDContentNSView(frame: NSRect(x: 0, y: 0, width: 172, height: 44))
+        view.layer?.cornerCurve = .continuous
+        view.layer?.cornerRadius = 22
+        view.layer?.masksToBounds = true
+        view.autoresizingMask = [.width, .height]
 
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
@@ -299,7 +426,7 @@ final class VoiceHUDController {
             glass.layer?.cornerCurve = .continuous
             glass.layer?.cornerRadius = 22
             glass.layer?.masksToBounds = true
-            glass.contentView = host
+            glass.contentView = view
             p.contentView = glass
             self.glassContainerView = glass
         } else {
@@ -311,39 +438,67 @@ final class VoiceHUDController {
             effect.layer?.masksToBounds = true
             effect.layer?.cornerCurve = .continuous
             effect.layer?.cornerRadius = 22
-            host.translatesAutoresizingMaskIntoConstraints = false
-            effect.addSubview(host)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(view)
             NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-                host.topAnchor.constraint(equalTo: effect.topAnchor),
-                host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+                view.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                view.topAnchor.constraint(equalTo: effect.topAnchor),
+                view.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
             ])
             p.contentView = effect
             self.fallbackEffectView = effect
         }
 
         self.panel = p
-        self.hostingView = host
+        self.contentNSView = view
+        bindManager()
+    }
+
+    private func bindManager() {
+        let mgr = VoiceInputManager.shared
+        mgr.$audioLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] level in
+                self?.contentNSView.updateAudioLevel(level)
+            }
+            .store(in: &cancellables)
+
+        Publishers.MergeMany(
+            mgr.$isRecording.map { _ in () }.eraseToAnyPublisher(),
+            mgr.$isMicReady.map { _ in () }.eraseToAnyPublisher(),
+            mgr.$isRecognizing.map { _ in () }.eraseToAnyPublisher(),
+            mgr.$isErrorState.map { _ in () }.eraseToAnyPublisher(),
+            mgr.$statusText.map { _ in () }.eraseToAnyPublisher(),
+            mgr.$activeChannel.map { _ in () }.eraseToAnyPublisher()
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] in
+            guard let self else { return }
+            self.contentNSView.refresh(from: VoiceInputManager.shared)
+            if self.panel.isVisible {
+                self.updateLayout()
+            }
+        }
+        .store(in: &cancellables)
     }
 
     func show() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        visibilityState.isVisible = true
+        contentNSView.setHUDVisible(true)
         updateLayout()
         panel.orderFrontRegardless()
     }
 
     func updateLayout() {
         panel.ignoresMouseEvents = true
-
-        hostingView.layoutSubtreeIfNeeded()
-        let size = hostingView.fittingSize
+        contentNSView.refresh(from: VoiceInputManager.shared)
+        let size = contentNSView.preferredSize()
         guard size.width > 0 && size.height > 0 else { return }
 
         let cornerRadius: CGFloat = round(size.height / 2)
-        hostingView.layer?.cornerRadius = cornerRadius
+        contentNSView.layer?.cornerRadius = cornerRadius
         if #available(macOS 26.0, *), let glass = glassContainerView as? NSGlassEffectView {
             glass.style = .regular
             glass.tintColor = nil
@@ -358,8 +513,7 @@ final class VoiceHUDController {
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main
         let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let backingScale = max(1.0, screen?.backingScaleFactor ?? 2.0)
-        let desiredGapAboveDockPx: CGFloat = 15.0
-        let desiredGapPt = desiredGapAboveDockPx / backingScale
+        let desiredGapPt: CGFloat = 15.0 / backingScale
 
         let origin = NSPoint(
             x: round(visibleFrame.midX - size.width / 2),
@@ -372,12 +526,12 @@ final class VoiceHUDController {
     func hide(after delay: TimeInterval = 0) {
         hideWorkItem?.cancel()
         if delay <= 0 {
-            visibilityState.isVisible = false
+            contentNSView.setHUDVisible(false)
             panel.orderOut(nil)
             return
         }
         let work = DispatchWorkItem { [weak self] in
-            self?.visibilityState.isVisible = false
+            self?.contentNSView.setHUDVisible(false)
             self?.panel.orderOut(nil)
         }
         hideWorkItem = work
