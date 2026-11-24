@@ -2283,7 +2283,9 @@ private struct AdvancedSettingsView: View {
                     SettingRowTitle(
                         installed ? "\(selected.shortName) 已安装" : "\(selected.shortName) 未下载（\(selected.approximateSizeLabel)）",
                         subtitle: grammarManager.statusMessage.isEmpty
-                            ? (installed ? "已自动软链到所有词库方案，重启或部署后生效" : "按需下载至 ~/Library/InputType/models/，不占主安装包体积")
+                            ? (installed
+                                ? (settings.grammarModelEnabled ? "已启用并生效" : "已安装，开启上方开关后生效")
+                                : "按需下载，不占主安装包体积")
                             : grammarManager.statusMessage
                     )
                     Spacer()

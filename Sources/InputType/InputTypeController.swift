@@ -2018,7 +2018,23 @@ final class InputTypeController: IMKInputController {
 
     private func commitCandidate(withText text: String, client: (any IMKTextInput)?) {
         queryCoordinator.cancelAll()
+        let matchedPresented = currentPresentedCandidates.first(where: { $0.text == text })
         if asciiComposingBuffer != nil || currentDirectCommitTexts.contains(text) {
+            if asciiComposingBuffer == nil,
+               InputSettings.shared.personalRankingEnabled,
+               let presented = matchedPresented,
+               presented.isWholeSentence {
+                let learnCode = presented.repairedCode ?? UserRankingEngine.normalizeCode(currentPreedit)
+                let displayedRank = currentPresentedCandidates.firstIndex(where: { $0.text == text }) ?? 0
+                if !learnCode.isEmpty {
+                    UserRankingEngine.shared.recordSelection(
+                        code: learnCode,
+                        word: text,
+                        rank: displayedRank,
+                        isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
+                    )
+                }
+            }
             asciiComposingBuffer = nil
             RimeEngine.shared.clearComposition(sessionId: sessionId)
             currentPreedit = ""
@@ -2763,6 +2779,62 @@ final class InputTypeController: IMKInputController {
                 directPrefixItems: extraItems,
                 syllableCount: syllableCount
             )
+
+            // Plan A Pillar 2: QWERTY physical-distance Pinyin Augmenter (zero cost on clean pinyin & pure简拼)
+            let rawInputForAugment = (context.selStart == 0) ? (RimeEngine.shared.getRawInput(sessionId: sessionId) ?? "") : ""
+            let rawCaretForAugment = (context.selStart == 0 && !rawInputForAugment.isEmpty)
+                ? RimeEngine.shared.getCaretPos(sessionId: sessionId)
+                : 0
+            if InputSettings.shared.typoCorrectionEnabled,
+               context.selStart == 0,
+               !rawInputForAugment.isEmpty,
+               rawCaretForAugment == rawInputForAugment.utf8.count {
+                let diag = PinyinTypoAugmenter.diagnose(rawInput: rawInputForAugment, preedit: context.preedit)
+                if diag != .none {
+                    let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: rawInputForAugment, maxCandidates: 3)
+                    if !repairs.isEmpty {
+                        let queried = RimeEngine.shared.queryRepairedCandidates(
+                            sessionId: sessionId,
+                            rawInputToRestore: rawInputForAugment,
+                            caretToRestore: rawCaretForAugment,
+                            repairedInputs: repairs.map(\.pinyin)
+                        )
+                        var existingKeys = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
+                        var repairedCands: [PresentedCandidate] = []
+                        for (idx, item) in queried.enumerated() {
+                            let key = CandidatePipeline.dedupeKey(for: item.text)
+                            guard !key.isEmpty, !existingKeys.contains(key) else { continue }
+                            existingKeys.insert(key)
+                            currentDirectCommitTexts.insert(item.text)
+                            repairedCands.append(
+                                PresentedCandidate(
+                                    text: item.text,
+                                    comment: nil,
+                                    originalRimeIndex: nil,
+                                    isDirectCommit: true,
+                                    isWholeSentence: true,
+                                    baseRank: idx,
+                                    repairedCode: item.repairedInput
+                                )
+                            )
+                        }
+                        if !repairedCands.isEmpty {
+                            // Insert repaired whole sentences right after any direct custom phrases
+                            let insertPos = presented.firstIndex(where: { !($0.isDirectCommit && !$0.isWholeSentence) }) ?? presented.count
+                            if diag == .broken {
+                                presented.insert(contentsOf: repairedCands, at: insertPos)
+                            } else {
+                                // `.suspicious`: promote ahead of fragmented Rime output when repaired is cleaner/shorter
+                                let rimeTopLen = presented.dropFirst(insertPos).first?.text.count ?? Int.max
+                                let repairLen = repairedCands[0].text.count
+                                let targetPos = (repairLen < rimeTopLen) ? insertPos : min(insertPos + 1, presented.count)
+                                presented.insert(contentsOf: repairedCands, at: targetPos)
+                            }
+                        }
+                    }
+                }
+            }
+
             let bundleID = client?.bundleIdentifier()
             if InputSettings.shared.personalRankingEnabled {
                 presented = UserRankingEngine.shared.rerank(
@@ -2813,11 +2885,23 @@ final class InputTypeController: IMKInputController {
                 )
             }
 
-            // Tier 2: Optional cancellable async neural reranking (long sentences / contextual ambiguity)
+            // Plan A Pillar 3 + Tier 2:
+            // After 45ms debounce, branch Rime's top alternate prefixes into genuine N-best whole-sentence beams
+            // (breaking Rime Poet's 1-sentence limit) and feed them to LocalNeuralReranker when enabled.
             let contextPrefix = InputSettings.shared.personalRankingEnabled
                 ? EmitHistory.shared.recentContext(forBundleID: bundleID, maxChars: 80)
                 : ""
-            if LocalNeuralReranker.shared.shouldTrigger(
+            let wholeSentenceCount = presented.prefix(8).filter(\.isWholeSentence).count
+            let canExpandNBest = (context.selStart == 0)
+                && !rawInputForAugment.isEmpty
+                && rawCaretForAugment == rawInputForAugment.utf8.count
+                && syllableCount >= 3
+                && wholeSentenceCount < 4
+            let neuralPotentiallyEligible = LocalNeuralReranker.shared.isInstalled
+                && InputSettings.shared.localRerankerEnabled
+                && (syllableCount >= 6 || (syllableCount >= 2 && !contextPrefix.isEmpty))
+
+            if canExpandNBest || LocalNeuralReranker.shared.shouldTrigger(
                 syllableCount: syllableCount,
                 candidates: presented,
                 contextPrefix: contextPrefix
@@ -2825,32 +2909,112 @@ final class InputTypeController: IMKInputController {
                 let snapshotPreedit = context.preedit
                 let snapshotCandidates = presented
                 let snapshotCode = normalizedQuery
-                queryCoordinator.schedule(
-                    work: {
-                        await LocalNeuralReranker.shared.rerank(
-                            preedit: snapshotPreedit,
-                            candidates: snapshotCandidates,
-                            contextPrefix: contextPrefix,
-                            normalizedCode: snapshotCode
-                        )
-                    },
-                    onResult: { [weak self] result, asyncMs in
-                        guard let self, self.currentPreedit == result.preedit else { return }
-                        let outcome = self.candidatePresenter.presentAsync(
-                            preedit: result.preedit,
-                            reranked: result.candidates,
-                            leadMargin: result.leadMargin
-                        )
-                        LatencyProbe.shared.recordAsyncApplied(ms: asyncMs, flippedTop1: outcome.flippedTop1)
-                        if outcome.didChange {
-                            self.currentPresentedCandidates = self.candidatePresenter.currentCandidates
-                            self.currentCandidates = self.currentPresentedCandidates.map {
-                                RimeCandidateItem(text: $0.text, comment: $0.comment)
+                let snapshotRawInput = rawInputForAugment
+                let snapshotCaret = rawCaretForAugment
+                let shouldExpand = canExpandNBest && (neuralPotentiallyEligible || (syllableCount >= 4 && wholeSentenceCount <= 1))
+
+                if shouldExpand || neuralPotentiallyEligible {
+                    queryCoordinator.schedule(
+                        work: { [weak self] () async -> NeuralRerankResult? in
+                            var workingCandidates = snapshotCandidates
+                            var newlyExpandedTexts: [String] = []
+
+                            if shouldExpand {
+                                let expanded: [String] = await MainActor.run {
+                                    guard let self,
+                                          self.currentPreedit == snapshotPreedit,
+                                          self.currentPreeditSelStart == 0 else {
+                                        return []
+                                    }
+                                    let topWholeLen = snapshotCandidates.first(where: \.isWholeSentence)?.text.count ?? syllableCount
+                                    let minWholeChars = max(syllableCount - 1, topWholeLen - 1)
+                                    let prefixIndices: [Int] = snapshotCandidates
+                                        .prefix(10)
+                                        .compactMap { cand -> Int? in
+                                            guard !cand.isDirectCommit,
+                                                  !cand.isWholeSentence,
+                                                  let rimeIdx = cand.originalRimeIndex,
+                                                  cand.text.count < topWholeLen else {
+                                                return nil
+                                            }
+                                            return rimeIdx
+                                        }
+                                        .prefix(3)
+                                        .map { $0 }
+                                    guard !prefixIndices.isEmpty else { return [] }
+                                    return RimeEngine.shared.expandAlternateWholeSentences(
+                                        sessionId: self.sessionId,
+                                        rawInputToRestore: snapshotRawInput,
+                                        caretToRestore: snapshotCaret,
+                                        prefixIndices: prefixIndices,
+                                        existingTexts: Set(snapshotCandidates.map(\.text)),
+                                        minCharCount: minWholeChars,
+                                        maxSentences: 3
+                                    )
+                                }
+                                newlyExpandedTexts = expanded
+                                if !expanded.isEmpty {
+                                    var insertAt = workingCandidates.firstIndex(where: { !$0.isWholeSentence && !$0.isDirectCommit })
+                                        ?? min(1, workingCandidates.count)
+                                    if insertAt == 0 && !workingCandidates.isEmpty {
+                                        insertAt = 1
+                                    }
+                                    let extraWhole = expanded.enumerated().map { offset, sentence in
+                                        PresentedCandidate(
+                                            text: sentence,
+                                            comment: nil,
+                                            originalRimeIndex: nil,
+                                            isDirectCommit: true,
+                                            isWholeSentence: true,
+                                            baseRank: insertAt + offset
+                                        )
+                                    }
+                                    workingCandidates.insert(contentsOf: extraWhole, at: min(insertAt, workingCandidates.count))
+                                }
                             }
-                            AppDelegate.sharedCandidates?.update()
+
+                            if LocalNeuralReranker.shared.shouldTrigger(
+                                syllableCount: syllableCount,
+                                candidates: workingCandidates,
+                                contextPrefix: contextPrefix
+                            ) {
+                                return await LocalNeuralReranker.shared.rerank(
+                                    preedit: snapshotPreedit,
+                                    candidates: workingCandidates,
+                                    contextPrefix: contextPrefix,
+                                    normalizedCode: snapshotCode
+                                )
+                            }
+
+                            guard !newlyExpandedTexts.isEmpty else { return nil }
+                            // Surface alternate full sentences at slots 1..3 without touching Top-1
+                            return NeuralRerankResult(
+                                preedit: snapshotPreedit,
+                                candidates: workingCandidates,
+                                leadMargin: 0.0
+                            )
+                        },
+                        onResult: { [weak self] result, asyncMs in
+                            guard let self, self.currentPreedit == result.preedit else { return }
+                            for cand in result.candidates where cand.isDirectCommit {
+                                self.currentDirectCommitTexts.insert(cand.text)
+                            }
+                            let outcome = self.candidatePresenter.presentAsync(
+                                preedit: result.preedit,
+                                reranked: result.candidates,
+                                leadMargin: result.leadMargin
+                            )
+                            LatencyProbe.shared.recordAsyncApplied(ms: asyncMs, flippedTop1: outcome.flippedTop1)
+                            if outcome.didChange {
+                                self.currentPresentedCandidates = self.candidatePresenter.currentCandidates
+                                self.currentCandidates = self.currentPresentedCandidates.map {
+                                    RimeCandidateItem(text: $0.text, comment: $0.comment)
+                                }
+                                AppDelegate.sharedCandidates?.update()
+                            }
                         }
-                    }
-                )
+                    )
+                }
             }
         }
     }

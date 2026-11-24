@@ -301,7 +301,7 @@ final class UserRankingEngine {
         var prefixDirect: [PresentedCandidate] = []
         var rimeCandidates: [PresentedCandidate] = []
         for cand in candidates {
-            if cand.isDirectCommit {
+            if cand.isDirectCommit && !cand.isWholeSentence {
                 prefixDirect.append(cand)
             } else {
                 rimeCandidates.append(cand)

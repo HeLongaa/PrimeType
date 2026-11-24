@@ -537,4 +537,125 @@ final class RimeEngine {
     func setAsciiMode(sessionId: RimeSessionId, enabled: Bool) {
         setOption(sessionId: sessionId, name: "ascii_mode", enabled: enabled)
     }
+
+    // MARK: - Plan A: Single-Session Scratch Queries (Zero Extra Memory / Sessions)
+
+    /// Atomically evaluates repaired pinyin strings on the existing shared session via `set_input`
+    /// and restores the exact original `rawInputToRestore` + `caretToRestore` before returning.
+    func queryRepairedCandidates(
+        sessionId: RimeSessionId,
+        rawInputToRestore: String,
+        caretToRestore: Int,
+        repairedInputs: [String]
+    ) -> [(repairedInput: String, text: String)] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, sessionId != 0,
+              let setInput = api.pointee.set_input,
+              !repairedInputs.isEmpty else {
+            return []
+        }
+
+        var results: [(repairedInput: String, text: String)] = []
+        var seenTexts = Set<String>()
+        results.reserveCapacity(repairedInputs.count)
+
+        for candidateInput in repairedInputs {
+            api.pointee.clear_composition(sessionId)
+            let ok = candidateInput.withCString { setInput(sessionId, $0) != 0 }
+            guard ok else { continue }
+
+            var ctx = RimeContext()
+            ctx.data_size = Int32(MemoryLayout<RimeContext>.size - MemoryLayout<Int32>.size)
+            if api.pointee.get_context(sessionId, &ctx) != 0 {
+                let preview = ctx.commit_text_preview.map { String(cString: $0) } ?? ""
+                let firstCand: String = {
+                    if let ptr = ctx.menu.candidates, ctx.menu.num_candidates > 0, let txt = ptr[0].text {
+                        return String(cString: txt)
+                    }
+                    return ""
+                }()
+                _ = api.pointee.free_context(&ctx)
+
+                let chosen = !preview.isEmpty ? preview : firstCand
+                if !chosen.isEmpty && !seenTexts.contains(chosen) {
+                    seenTexts.insert(chosen)
+                    results.append((candidateInput, chosen))
+                }
+            }
+        }
+
+        // Restore exact user composition state atomically before releasing lock
+        api.pointee.clear_composition(sessionId)
+        _ = rawInputToRestore.withCString { setInput(sessionId, $0) }
+        api.pointee.set_caret_pos?(sessionId, max(0, caretToRestore))
+        return results
+    }
+
+    /// Generates genuine N-best alternate whole-sentence candidates by temporarily branching Rime's
+    /// top shorter prefix candidates (`prefixIndices`) and reading `commit_text_preview`,
+    /// then restoring the exact original `rawInputToRestore` + `caretToRestore` atomically.
+    func expandAlternateWholeSentences(
+        sessionId: RimeSessionId,
+        rawInputToRestore: String,
+        caretToRestore: Int,
+        prefixIndices: [Int],
+        existingTexts: Set<String>,
+        minCharCount: Int,
+        maxSentences: Int = 3
+    ) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, sessionId != 0,
+              let setInput = api.pointee.set_input,
+              !prefixIndices.isEmpty else {
+            return []
+        }
+
+        var expanded: [String] = []
+        var seen = existingTexts
+        expanded.reserveCapacity(maxSentences)
+
+        for prefixIdx in prefixIndices {
+            guard expanded.count < maxSentences else { break }
+
+            // Re-seed clean raw input before each branch
+            api.pointee.clear_composition(sessionId)
+            guard rawInputToRestore.withCString({ setInput(sessionId, $0) != 0 }) else { continue }
+
+            guard api.pointee.select_candidate(sessionId, prefixIdx) != 0 else { continue }
+
+            // Read completed full sentence preview without committing to userdb
+            var ctx = RimeContext()
+            ctx.data_size = Int32(MemoryLayout<RimeContext>.size - MemoryLayout<Int32>.size)
+            if api.pointee.get_context(sessionId, &ctx) != 0 {
+                let preview = ctx.commit_text_preview.map { String(cString: $0) } ?? ""
+                _ = api.pointee.free_context(&ctx)
+                if preview.count >= minCharCount && !seen.contains(preview) {
+                    seen.insert(preview)
+                    expanded.append(preview)
+                }
+            } else {
+                // Drain any unexpected commit so it never leaks to the next keystroke
+                var commit = RimeCommit()
+                commit.data_size = Int32(MemoryLayout<RimeCommit>.size - MemoryLayout<Int32>.size)
+                if api.pointee.get_commit(sessionId, &commit) != 0 {
+                    if let ptr = commit.text {
+                        let text = String(cString: ptr)
+                        if text.count >= minCharCount && !seen.contains(text) {
+                            seen.insert(text)
+                            expanded.append(text)
+                        }
+                    }
+                    _ = api.pointee.free_commit(&commit)
+                }
+            }
+        }
+
+        // Always restore exact user composition state atomically
+        api.pointee.clear_composition(sessionId)
+        _ = rawInputToRestore.withCString { setInput(sessionId, $0) }
+        api.pointee.set_caret_pos?(sessionId, max(0, caretToRestore))
+        return expanded
+    }
 }

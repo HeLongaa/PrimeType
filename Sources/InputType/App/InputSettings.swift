@@ -1089,10 +1089,8 @@ final class InputSettings: ObservableObject {
             }
         }
         if typoCorrectionEnabled {
-            // Zero-collision typo derivations (derived forms cannot collide with valid Mandarin syllables):
-            // - gn / mg transposition/adjacent-key for -ng finals (e.g. zhognguo -> 中国, zhemgchang -> 正常)
-            // - ina / una transposition for -ian / -uan finals
-            // - doubled initial consonant dedup (e.g. nihhao -> 你好)
+            // Zero-collision Rime algebra derivations (exact matches always stay unaffected, no normal long-sentence regression);
+            // adjacent-key, transposition, extra-key, and missing-vowel typos are handled surgically by PinyinTypoAugmenter.
             extraAlgebra.append(contentsOf: [
                 "derive/([aoei])ng$/$1gn/",
                 "derive/([aoei])ng$/$1mg/",

@@ -207,6 +207,40 @@ if CommandLine.arguments.contains("--self-test-experience") {
         "VoicePreRollBuffer enforces 150ms (2400-sample) rolling pre-roll, cold begin-padding, and lossless short-stop flush"
     )
 
+    // 13. Plan A PinyinTypoAugmenter: zero false positives on clean pinyin & pure简拼, accurate QWERTY repairs on typos
+    assertCheck(
+        PinyinTypoAugmenter.diagnose(rawInput: "xianzaishishi", preedit: "xian zai shi shi") == .none
+        && PinyinTypoAugmenter.diagnose(rawInput: "mwt", preedit: "m w t") == .none
+        && PinyinTypoAugmenter.diagnose(rawInput: "cxy", preedit: "c x y") == .none
+        && PinyinTypoAugmenter.diagnose(rawInput: "wozaijiabam", preedit: "wo zai jia ba m") == .broken
+        && PinyinTypoAugmenter.diagnose(rawInput: "nohao", preedit: "n o hao") == .broken
+        && PinyinTypoAugmenter.diagnose(rawInput: "shjian", preedit: "sh jian") == .broken
+        && PinyinTypoAugmenter.diagnose(rawInput: "xianzia", preedit: "xian zi a") == .suspicious,
+        "PinyinTypoAugmenter cleanly distinguishes normal/abbrev input from mistyped pinyin"
+    )
+    let repairChecks: [(String, String)] = [
+        ("wozaijiabam", "wozaijiaban"),
+        ("nohao", "nihao"),
+        ("xiamzai", "xianzai"),
+        ("shjian", "shijian"),
+        ("xianzia", "xianzai"),
+        ("mingtiam", "mingtian"),
+        ("shemme", "shenme"),
+        ("wnti", "wenti"),
+        ("weixni", "weixin")
+    ]
+    var missedRepairs: [String] = []
+    for (raw, expected) in repairChecks {
+        let got = PinyinTypoAugmenter.generateRepairs(rawInput: raw, maxCandidates: 3).map(\.pinyin)
+        if !got.contains(expected) {
+            missedRepairs.append("\(raw)->want:\(expected) got:\(got)")
+        }
+    }
+    if !missedRepairs.isEmpty {
+        print("  REPAIR_MISSES: \(missedRepairs.joined(separator: "; "))")
+    }
+    assertCheck(missedRepairs.isEmpty, "PinyinTypoAugmenter repairs adjacent-key, transposition, and missing-vowel typos")
+
     print(failures.isEmpty ? "SELF_TEST_ALL_PASSED" : "SELF_TEST_FAILED: \(failures.joined(separator: ", "))")
     exit(failures.isEmpty ? 0 : 1)
 }
@@ -236,7 +270,7 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
     try? FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
 
     let sharedDir = RimeEngine.shared.sharedDataDir(for: presetArg)
-    // Write isolated custom YAML with typo correction + grammar (if installed)
+    // Write isolated custom YAML with Plan A typo correction + grammar (if installed)
     let customURL = tmpRoot.appendingPathComponent("\(presetArg.schemaID).custom.yaml")
     var customLines = [
         "patch:",
@@ -293,7 +327,44 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
         let syl = CandidatePipeline.syllableCount(from: ctx?.preedit ?? pinyin)
         let limit = CandidatePipeline.adaptiveFetchLimit(syllableCount: syl, isExpanded: false)
         let raw = RimeEngine.shared.getAllCandidates(sessionId: session, limit: limit)
-        let presented = CandidatePipeline.buildCandidates(rimeCandidates: raw, directPrefixItems: [], syllableCount: syl)
+        var presented = CandidatePipeline.buildCandidates(rimeCandidates: raw, directPrefixItems: [], syllableCount: syl)
+        if let ctx, ctx.selStart == 0 {
+            let diag = PinyinTypoAugmenter.diagnose(rawInput: pinyin, preedit: ctx.preedit)
+            if diag != .none {
+                let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: pinyin, maxCandidates: 3)
+                let queried = RimeEngine.shared.queryRepairedCandidates(
+                    sessionId: session,
+                    rawInputToRestore: pinyin,
+                    caretToRestore: pinyin.utf8.count,
+                    repairedInputs: repairs.map(\.pinyin)
+                )
+                var existing = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
+                var repairedCands: [PresentedCandidate] = []
+                for (idx, item) in queried.enumerated() {
+                    let key = CandidatePipeline.dedupeKey(for: item.text)
+                    guard !key.isEmpty, !existing.contains(key) else { continue }
+                    existing.insert(key)
+                    repairedCands.append(
+                        PresentedCandidate(
+                            text: item.text,
+                            comment: nil,
+                            originalRimeIndex: nil,
+                            isDirectCommit: true,
+                            isWholeSentence: true,
+                            baseRank: idx,
+                            repairedCode: item.repairedInput
+                        )
+                    )
+                }
+                if !repairedCands.isEmpty {
+                    if diag == .broken || repairedCands[0].text.count < (presented.first?.text.count ?? Int.max) {
+                        presented.insert(contentsOf: repairedCands, at: 0)
+                    } else {
+                        presented.insert(contentsOf: repairedCands, at: min(1, presented.count))
+                    }
+                }
+            }
+        }
 
         total += 1
         let isTop1 = presented.first?.text == expected

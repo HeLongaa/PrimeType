@@ -204,7 +204,7 @@ final class LocalNeuralReranker: NSObject, ObservableObject {
         contextPrefix: String
     ) -> Bool {
         guard InputSettings.shared.localRerankerEnabled, isInstalled else { return false }
-        let wholeCount = candidates.prefix(8).filter { !$0.isDirectCommit && $0.isWholeSentence }.count
+        let wholeCount = candidates.prefix(8).filter(\.isWholeSentence).count
         guard wholeCount >= 2 else { return false }
         if syllableCount >= 6 { return true }
         if syllableCount >= 2 && !contextPrefix.isEmpty { return true }
@@ -229,7 +229,7 @@ final class LocalNeuralReranker: NSObject, ObservableObject {
         var prefixDirect: [PresentedCandidate] = []
         var rimePool: [PresentedCandidate] = []
         for c in candidates {
-            if c.isDirectCommit { prefixDirect.append(c) }
+            if c.isDirectCommit && !c.isWholeSentence { prefixDirect.append(c) }
             else { rimePool.append(c) }
         }
 
