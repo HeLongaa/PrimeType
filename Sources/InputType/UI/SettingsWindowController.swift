@@ -1,5 +1,6 @@
 import AVFoundation
 import Cocoa
+import Darwin
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -4270,6 +4271,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                     self.window = nil
                 }
             }
+            malloc_zone_pressure_relief(nil, 0)
         }
     }
 }

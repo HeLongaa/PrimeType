@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import SwiftUI
 
 private enum ClipboardFilterType: String, CaseIterable, Identifiable {
@@ -78,6 +79,7 @@ private struct RowClickCatcher: NSViewRepresentable {
 
 private enum ClipboardAppIconCache {
     private static var cache: [String: NSImage] = [:]
+    private static let maxCachedIcons = 24
 
     static func icon(forBundleID bundleID: String) -> NSImage? {
         if let cached = cache[bundleID] {
@@ -86,9 +88,22 @@ private enum ClipboardAppIconCache {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
             return nil
         }
-        let img = NSWorkspace.shared.icon(forFile: url.path)
-        cache[bundleID] = img
-        return img
+        // Downsample multi-resolution app icons (which include 512/1024px reps) to a lightweight 32x32 bitmap
+        let rawIcon = NSWorkspace.shared.icon(forFile: url.path)
+        let targetSize = NSSize(width: 32, height: 32)
+        let small = NSImage(size: targetSize, flipped: false) { rect in
+            rawIcon.draw(in: rect)
+            return true
+        }
+        if cache.count >= maxCachedIcons {
+            cache.removeAll(keepingCapacity: false)
+        }
+        cache[bundleID] = small
+        return small
+    }
+
+    static func clear() {
+        cache.removeAll(keepingCapacity: false)
     }
 }
 
@@ -322,7 +337,7 @@ private struct ClipboardPopupView: View {
     private func entryRow(_ entry: ClipboardEntry) -> some View {
         let isSelected = (selectedEntry?.id == entry.id)
         return HStack(spacing: 10) {
-            if entry.kind == .image, let img = manager.image(for: entry) {
+            if entry.kind == .image, let img = manager.thumbnailImage(for: entry) {
                 Image(nsImage: img)
                     .resizable()
                     .scaledToFill()
@@ -390,7 +405,7 @@ private struct ClipboardPopupView: View {
 
     @ViewBuilder
     private func previewArea(for entry: ClipboardEntry) -> some View {
-        if entry.kind == .image, let img = manager.image(for: entry) {
+        if entry.kind == .image, let img = manager.previewImage(for: entry) {
             Image(nsImage: img)
                 .resizable()
                 .scaledToFit()
@@ -911,7 +926,11 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         p.onCommandDragCancel = { [weak self] in
             self?.guideOverlay.hideGuides()
         }
+        p.delegate = self
+    }
 
+    private func attachContentViewIfNeeded() {
+        guard panel.contentView == nil else { return }
         let rootView = ClipboardPopupView(
             state: state,
             onPaste: { [weak self] entry in
@@ -939,7 +958,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             glass.layer?.cornerRadius = 20
             glass.layer?.masksToBounds = true
             glass.contentView = host
-            p.contentView = glass
+            panel.contentView = glass
         } else {
             let effect = NSVisualEffectView()
             effect.material = .hudWindow
@@ -957,9 +976,8 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
                 host.topAnchor.constraint(equalTo: effect.topAnchor),
                 host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
             ])
-            p.contentView = effect
+            panel.contentView = effect
         }
-        p.delegate = self
     }
 
     func toggle() {
@@ -983,6 +1001,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             firstEntryID: ClipboardManager.shared.entries.first?.id
         )
 
+        attachContentViewIfNeeded()
         positionOnActiveScreen()
         panel.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
@@ -1002,6 +1021,15 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         if restoreFocus, let target = previousApp {
             NSApp.yieldActivation(to: target)
             target.activate()
+        }
+        // Tear down SwiftUI view tree and image caches once hidden so clipboard UI & thumbnails
+        // do not stay resident in the background IME process.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.panel.isVisible else { return }
+            self.panel.contentView = nil
+            ClipboardAppIconCache.clear()
+            ClipboardManager.shared.clearImageCache()
+            malloc_zone_pressure_relief(nil, 0)
         }
     }
 

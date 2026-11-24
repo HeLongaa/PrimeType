@@ -1,6 +1,8 @@
 import Cocoa
 import Carbon
 import Combine
+import Darwin
+import ImageIO
 import ApplicationServices
 
 enum ClipboardItemKind: String, Codable, CaseIterable, Identifiable {
@@ -135,10 +137,16 @@ final class ClipboardManager: ObservableObject {
     private var lastChangeCount: Int
     private var cancellable: AnyCancellable?
     private var retentionCancellable: AnyCancellable?
-    private let imageCache: NSCache<NSUUID, NSImage> = {
+    private let thumbnailCache: NSCache<NSUUID, NSImage> = {
         let cache = NSCache<NSUUID, NSImage>()
-        cache.countLimit = 20
-        cache.totalCostLimit = 32 * 1024 * 1024 // 32 MB cap
+        cache.countLimit = 40
+        cache.totalCostLimit = 2 * 1024 * 1024 // 2 MB cap for 64px list icons
+        return cache
+    }()
+    private let previewCache: NSCache<NSUUID, NSImage> = {
+        let cache = NSCache<NSUUID, NSImage>()
+        cache.countLimit = 6
+        cache.totalCostLimit = 6 * 1024 * 1024 // 6 MB cap for 720px detail previews
         return cache
     }()
     private var pendingIMKTextPaste: PendingIMKTextPaste?
@@ -221,14 +229,7 @@ final class ClipboardManager: ObservableObject {
         }
 
         if hasImageType && !hasTextType {
-            if let pngData = extractPNGData(from: pb),
-               let img = NSImage(data: pngData) {
-                recordImageEntry(
-                    pngData: pngData,
-                    image: img,
-                    sourceAppName: appName,
-                    sourceAppBundleID: appBundleId
-                )
+            if capturePasteboardImage(from: pb, sourceAppName: appName, sourceAppBundleID: appBundleId) {
                 return
             }
         }
@@ -247,14 +248,46 @@ final class ClipboardManager: ObservableObject {
             }
         }
 
-        if hasImageType, let pngData = extractPNGData(from: pb), let img = NSImage(data: pngData) {
-            recordImageEntry(
-                pngData: pngData,
-                image: img,
-                sourceAppName: appName,
-                sourceAppBundleID: appBundleId
+        if hasImageType {
+            _ = capturePasteboardImage(from: pb, sourceAppName: appName, sourceAppBundleID: appBundleId)
+        }
+    }
+
+    @discardableResult
+    private func capturePasteboardImage(
+        from pb: NSPasteboard,
+        sourceAppName: String?,
+        sourceAppBundleID: String?
+    ) -> Bool {
+        var recordedEntry: ClipboardEntry?
+        autoreleasepool {
+            guard let pngData = extractPNGData(from: pb), !pngData.isEmpty else { return }
+            let id = UUID()
+            let filename = "\(id.uuidString).png"
+            let fileURL = imagesDirURL.appendingPathComponent(filename)
+            do {
+                try pngData.write(to: fileURL, options: .atomic)
+            } catch {
+                return
+            }
+            // Read pixel dimensions from header metadata without decoding full RGBA pixel buffer
+            let dims = Self.imagePixelSize(from: pngData)
+            recordedEntry = ClipboardEntry(
+                id: id,
+                kind: .image,
+                imageFilename: filename,
+                imageWidth: dims?.width,
+                imageHeight: dims?.height,
+                byteSize: pngData.count,
+                sourceAppName: sourceAppName,
+                sourceAppBundleID: sourceAppBundleID
             )
         }
+        guard let entry = recordedEntry else { return false }
+        insertEntry(entry)
+        // Return transient TIFF/PNG conversion pages promptly to macOS so peak spikes don't linger
+        malloc_zone_pressure_relief(nil, 0)
+        return true
     }
 
     private func extractPNGData(from pb: NSPasteboard) -> Data? {
@@ -267,6 +300,36 @@ final class ClipboardManager: ObservableObject {
             return png
         }
         return nil
+    }
+
+    private static func imagePixelSize(from data: Data) -> (width: Int, height: Int)? {
+        let sourceOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOpts),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, sourceOpts) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0 else {
+            return nil
+        }
+        return (w, h)
+    }
+
+    private static func loadDownsampledImage(at url: URL, maxPixelSize: Int) -> (image: NSImage, cost: Int)? {
+        let sourceOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOpts) else { return nil }
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceShouldCache: false,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
+            return nil
+        }
+        let img = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        let cost = max(1, cgImage.width * cgImage.height * 4)
+        return (img, cost)
     }
 
     private func recordTextEntry(
@@ -286,39 +349,6 @@ final class ClipboardManager: ObservableObject {
         insertEntry(entry)
     }
 
-    private func recordImageEntry(
-        pngData: Data,
-        image: NSImage,
-        sourceAppName: String?,
-        sourceAppBundleID: String?
-    ) {
-        let id = UUID()
-        let filename = "\(id.uuidString).png"
-        let fileURL = imagesDirURL.appendingPathComponent(filename)
-        try? pngData.write(to: fileURL, options: .atomic)
-
-        var pixelWidth = Int(image.size.width)
-        var pixelHeight = Int(image.size.height)
-        if let rep = image.representations.first, rep.pixelsWide > 0 && rep.pixelsHigh > 0 {
-            pixelWidth = rep.pixelsWide
-            pixelHeight = rep.pixelsHigh
-        }
-
-        let pixelCost = max(1, pixelWidth * pixelHeight * 4)
-        imageCache.setObject(image, forKey: id as NSUUID, cost: pixelCost)
-        let entry = ClipboardEntry(
-            id: id,
-            kind: .image,
-            imageFilename: filename,
-            imageWidth: pixelWidth,
-            imageHeight: pixelHeight,
-            byteSize: pngData.count,
-            sourceAppName: sourceAppName,
-            sourceAppBundleID: sourceAppBundleID
-        )
-        insertEntry(entry)
-    }
-
     private func insertEntry(_ entry: ClipboardEntry) {
         entries.insert(entry, at: 0)
         if entries.count > maxEntries {
@@ -331,23 +361,40 @@ final class ClipboardManager: ObservableObject {
         saveToDisk()
     }
 
-    func image(for entry: ClipboardEntry) -> NSImage? {
+    /// Lightweight 64px thumbnail for the 24x24 list row icon (~16 KB decoded instead of ~20 MB full-res).
+    func thumbnailImage(for entry: ClipboardEntry) -> NSImage? {
         guard entry.kind == .image, let filename = entry.imageFilename else { return nil }
         let key = entry.id as NSUUID
-        if let cached = imageCache.object(forKey: key) {
+        if let cached = thumbnailCache.object(forKey: key) {
             return cached
         }
         let url = imagesDirURL.appendingPathComponent(filename)
-        guard let img = NSImage(contentsOf: url) else { return nil }
-        let w = entry.imageWidth ?? Int(img.size.width)
-        let h = entry.imageHeight ?? Int(img.size.height)
-        let cost = max(1, w * h * 4)
-        imageCache.setObject(img, forKey: key, cost: cost)
-        return img
+        guard let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 64) else { return nil }
+        thumbnailCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
+        return loaded.image
+    }
+
+    /// Downsampled 720px preview for the detail pane (~0.8-1.3 MB decoded; full PNG on disk is still used when pasting).
+    func previewImage(for entry: ClipboardEntry) -> NSImage? {
+        guard entry.kind == .image, let filename = entry.imageFilename else { return nil }
+        let key = entry.id as NSUUID
+        if let cached = previewCache.object(forKey: key) {
+            return cached
+        }
+        let url = imagesDirURL.appendingPathComponent(filename)
+        guard let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 720) else { return nil }
+        previewCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
+        return loaded.image
+    }
+
+    func image(for entry: ClipboardEntry) -> NSImage? {
+        previewImage(for: entry)
     }
 
     func clearImageCache() {
-        imageCache.removeAllObjects()
+        thumbnailCache.removeAllObjects()
+        previewCache.removeAllObjects()
+        malloc_zone_pressure_relief(nil, 0)
     }
 
     /// Marks the current `NSPasteboard.general.changeCount` as already processed so internal
@@ -379,21 +426,24 @@ final class ClipboardManager: ObservableObject {
         pb.clearContents()
         switch entry.kind {
         case .image:
-            if let filename = entry.imageFilename,
-               let data = try? Data(contentsOf: imagesDirURL.appendingPathComponent(filename)) {
-                var types: [NSPasteboard.PasteboardType] = [.png]
-                let tiffData = NSImage(data: data)?.tiffRepresentation
-                if tiffData != nil {
-                    types.append(.tiff)
+            autoreleasepool {
+                if let filename = entry.imageFilename,
+                   let data = try? Data(contentsOf: imagesDirURL.appendingPathComponent(filename)) {
+                    var types: [NSPasteboard.PasteboardType] = [.png]
+                    let tiffData = NSImage(data: data)?.tiffRepresentation
+                    if tiffData != nil {
+                        types.append(.tiff)
+                    }
+                    pb.declareTypes(types, owner: nil)
+                    pb.setData(data, forType: .png)
+                    if let tiffData {
+                        pb.setData(tiffData, forType: .tiff)
+                    }
+                } else if let img = previewImage(for: entry) {
+                    pb.writeObjects([img])
                 }
-                pb.declareTypes(types, owner: nil)
-                pb.setData(data, forType: .png)
-                if let tiffData {
-                    pb.setData(tiffData, forType: .tiff)
-                }
-            } else if let img = image(for: entry) {
-                pb.writeObjects([img])
             }
+            malloc_zone_pressure_relief(nil, 0)
         case .text, .link:
             if let text = entry.text {
                 pb.setString(text, forType: .string)
@@ -529,12 +579,14 @@ final class ClipboardManager: ObservableObject {
             deleteImageFile(for: entry)
         }
         entries.removeAll()
-        imageCache.removeAllObjects()
+        clearImageCache()
         saveToDisk()
     }
 
     private func deleteImageFile(for entry: ClipboardEntry) {
-        imageCache.removeObject(forKey: entry.id as NSUUID)
+        let key = entry.id as NSUUID
+        thumbnailCache.removeObject(forKey: key)
+        previewCache.removeObject(forKey: key)
         if let filename = entry.imageFilename {
             try? FileManager.default.removeItem(at: imagesDirURL.appendingPathComponent(filename))
         }
