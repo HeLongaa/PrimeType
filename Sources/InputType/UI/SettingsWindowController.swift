@@ -2126,7 +2126,10 @@ private struct AdvancedSettingsView: View {
                                     await MainActor.run {
                                         isConfiguringLocalSign = false
                                         refreshPermissions()
-                                        showStatus("已生成并信任本机签名证书，后续自动更新将免除重复授权", isError: false)
+                                        showStatus("已启用本机签名，正在重启输入法以生效…", isError: false)
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                            NSApp.terminate(nil)
+                                        }
                                     }
                                 } catch {
                                     await MainActor.run {

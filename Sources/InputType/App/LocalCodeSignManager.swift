@@ -106,7 +106,17 @@ final class LocalCodeSignManager {
 
             // 3. Re-sign installed PrimeType.app immediately
             try Self.resignInstalledAppIfConfigured()
+
+            // 4. Clear stale Accessibility TCC record so the restarted process prompts cleanly once for the new certificate
+            _ = try? Self.run("/usr/bin/tccutil", [
+                "reset", "Accessibility",
+                Bundle.main.bundleIdentifier ?? "com.lumocore.inputmethod.PrimeType"
+            ])
         }.value
+
+        await MainActor.run {
+            InputSettings.shared.lastLaunchedVersion = "__local_resigned__"
+        }
     }
 
     func removeCertificate() async throws {
@@ -136,9 +146,8 @@ final class LocalCodeSignManager {
         }
     }
 
-    static func resignInstalledAppIfConfigured() throws {
+    static func signAppBundle(at appPath: String) throws {
         guard let sha1 = shared.firstIdentitySHA1() else { return }
-        let appPath = "/Library/Input Methods/PrimeType.app"
         guard FileManager.default.fileExists(atPath: appPath) else { return }
 
         let fm = FileManager.default
@@ -151,6 +160,10 @@ final class LocalCodeSignManager {
                 .replacingOccurrences(of: "\"", with: "\\\"")
             try run("/usr/bin/osascript", ["-e", "do shell script \"\(escaped)\" with administrator privileges"])
         }
+    }
+
+    static func resignInstalledAppIfConfigured() throws {
+        try signAppBundle(at: "/Library/Input Methods/PrimeType.app")
     }
 
     private static func run(_ executable: String, _ arguments: [String]) throws {

@@ -164,8 +164,17 @@ final class AppUpdateManager: ObservableObject {
                     ])
                 }
 
+                // Sign in temp directory BEFORE rsync (user-owned, no extra admin prompt, no silent failure)
+                if LocalCodeSignManager.shared.isCertificateConfigured() {
+                    await MainActor.run {
+                        self.downloadProgress = 0.88
+                        self.statusMessage = "正在使用本机签名证书重签更新包…"
+                    }
+                    try LocalCodeSignManager.signAppBundle(at: newAppURL.path)
+                }
+
                 await MainActor.run {
-                    self.downloadProgress = 0.85
+                    self.downloadProgress = 0.93
                     self.statusMessage = "正在安装并重启输入法…"
                 }
 
@@ -207,15 +216,6 @@ final class AppUpdateManager: ObservableObject {
                 }
 
                 try? fm.removeItem(at: tmpDir)
-
-                // If user enabled optional persistent local code-signing, re-sign in place so TCC permissions survive updates
-                if LocalCodeSignManager.shared.isCertificateConfigured() {
-                    await MainActor.run {
-                        self.downloadProgress = 0.95
-                        self.statusMessage = "正在使用本机签名证书重签…"
-                    }
-                    try? LocalCodeSignManager.resignInstalledAppIfConfigured()
-                }
 
                 await MainActor.run {
                     self.downloadProgress = 1.0

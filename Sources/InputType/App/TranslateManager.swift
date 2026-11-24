@@ -467,7 +467,7 @@ final class TranslateManager: ObservableObject {
 
         // 3. Fallback for apps that don't expose AX selection/value:
         //    Temporarily simulate Cmd+C (restoring pasteboard); if unchanged and in an input field, Cmd+A + Cmd+C.
-        captureTextViaClipboardFallback(isLikelyInput: axElement.map(isEditableInputElement) ?? InputTypeController.isServerCurrentlyActive) { [weak self] text, mode in
+        captureTextViaClipboardFallback(isLikelyInput: (axElement.map(isEditableInputElement) ?? false) || InputTypeController.isServerCurrentlyActive) { [weak self] text, mode in
             guard let self, self.isProcessing else { return }
             guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 self.showErrorPopup("未获取到可\(action.title)的文本，请先选中文本或在输入框中输入内容。", anchorRect: initialAnchor)
