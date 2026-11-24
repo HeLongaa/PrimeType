@@ -1,0 +1,133 @@
+import Foundation
+
+/// Represents a candidate displayed in the candidate bar while retaining its exact mapping back
+/// to Rime's internal candidate index so selection, userdb learning, and segmented commits stay intact.
+struct PresentedCandidate: Equatable {
+    let text: String
+    let comment: String?
+    /// Exact index in Rime's current candidate list (`nil` for direct-commit custom phrases / V-mode items).
+    let originalRimeIndex: Int?
+    let isDirectCommit: Bool
+    /// Heuristic flag indicating whether this candidate covers the full syllable span (safe for whole-sentence rerank).
+    let isWholeSentence: Bool
+    let baseRank: Int
+}
+
+enum CandidatePipeline {
+    /// Counts real Rime-segmented syllables from `context.preedit`.
+    static func syllableCount(from preedit: String) -> Int {
+        let trimmed = preedit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        let parts = trimmed.split { $0 == " " || $0 == "'" || $0 == "·" }
+        return max(parts.count, 1)
+    }
+
+    /// Adaptive Rime lazy-fetch budget: wide search for short queries (accuracy), narrow for long sentences (speed).
+    static func adaptiveFetchLimit(syllableCount: Int, isExpanded: Bool) -> Int {
+        if isExpanded {
+            switch syllableCount {
+            case ...5: return 160
+            case 6...10: return 120
+            default: return 80
+            }
+        } else {
+            switch syllableCount {
+            case ...2: return 36
+            case 3...5: return 28
+            case 6...10: return 18
+            default: return 12
+            }
+        }
+    }
+
+    /// Semantic deduplication key: trims whitespace, converts fullwidth ASCII to halfwidth,
+    /// folds ASCII case for pure Latin words, and collapses trivial formatting duplicates
+    /// while preserving original display text and `originalRimeIndex`.
+    static func dedupeKey(for text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(trimmed.unicodeScalars.count)
+        var isAllASCII = true
+        for scalar in trimmed.unicodeScalars {
+            let v = scalar.value
+            if v == 0x3000 { // Ideographic space
+                scalars.append(" ")
+            } else if v >= 0xFF01 && v <= 0xFF5E { // Fullwidth ASCII variants
+                if let mapped = UnicodeScalar(v - 0xFEE0) {
+                    scalars.append(mapped)
+                }
+            } else {
+                if v > 0x7F {
+                    isAllASCII = false
+                }
+                scalars.append(scalar)
+            }
+        }
+        let normalized = String(scalars)
+        return isAllASCII ? normalized.lowercased() : normalized
+    }
+
+    /// Builds deduplicated `PresentedCandidate` list while preserving exact Rime original indices
+    /// and marking which candidates are full-span whole-sentence candidates eligible for reranking.
+    static func buildCandidates(
+        rimeCandidates: [RimeCandidateItem],
+        directPrefixItems: [RimeCandidateItem],
+        syllableCount: Int
+    ) -> [PresentedCandidate] {
+        var seenKeys = Set<String>()
+        seenKeys.reserveCapacity(rimeCandidates.count + directPrefixItems.count)
+        var result: [PresentedCandidate] = []
+        result.reserveCapacity(rimeCandidates.count + directPrefixItems.count)
+
+        for (idx, item) in directPrefixItems.enumerated() {
+            let key = dedupeKey(for: item.text)
+            guard !key.isEmpty, !seenKeys.contains(key) else { continue }
+            seenKeys.insert(key)
+            result.append(
+                PresentedCandidate(
+                    text: item.text,
+                    comment: item.comment,
+                    originalRimeIndex: nil,
+                    isDirectCommit: true,
+                    isWholeSentence: false,
+                    baseRank: idx
+                )
+            )
+        }
+
+        // Top Rime candidate's character count approximates full-sentence length for multi-syllable queries
+        let topRimeCharCount = rimeCandidates.first?.text.count ?? 0
+        let wholeSpanMinChars = syllableCount >= 2 ? max(syllableCount - 1, topRimeCharCount - 1) : 1
+
+        for (rimeIdx, item) in rimeCandidates.enumerated() {
+            let key = dedupeKey(for: item.text)
+            guard !key.isEmpty, !seenKeys.contains(key) else { continue }
+            seenKeys.insert(key)
+
+            let charCount = item.text.count
+            let isWhole: Bool
+            if syllableCount <= 1 {
+                isWhole = true
+            } else if rimeIdx == 0 {
+                isWhole = true
+            } else {
+                isWhole = charCount >= wholeSpanMinChars
+            }
+
+            result.append(
+                PresentedCandidate(
+                    text: item.text,
+                    comment: item.comment,
+                    originalRimeIndex: rimeIdx,
+                    isDirectCommit: false,
+                    isWholeSentence: isWhole,
+                    baseRank: rimeIdx
+                )
+            )
+        }
+
+        return result
+    }
+}

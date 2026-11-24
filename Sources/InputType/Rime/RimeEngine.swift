@@ -130,12 +130,27 @@ final class RimeEngine {
             migrateLegacyRimeIceIfNeeded(to: targetUser)
         }
         ensureSharedUserDBLinked(in: targetUser)
+        GrammarModelManager.shared.ensureSymlinks(in: targetUser)
 
         let prismPath = "\(targetUser)/build/\(preset.schemaID).prism.bin"
         let tablePath = "\(targetUser)/build/\(preset.schemaID).table.bin"
+        let customYAMLPath = "\(targetUser)/\(preset.schemaID).custom.yaml"
+        let builtSchemaPath = "\(targetUser)/build/\(preset.schemaID).schema.yaml"
+        let customNewerThanBuild: Bool = {
+            guard let customAttr = try? FileManager.default.attributesOfItem(atPath: customYAMLPath),
+                  let customDate = customAttr[.modificationDate] as? Date else {
+                return false
+            }
+            guard let builtAttr = try? FileManager.default.attributesOfItem(atPath: builtSchemaPath),
+                  let builtDate = builtAttr[.modificationDate] as? Date else {
+                return true
+            }
+            return customDate > builtDate
+        }()
         let needsFullBuild = forceMaintenance
             || !FileManager.default.fileExists(atPath: prismPath)
             || !FileManager.default.fileExists(atPath: tablePath)
+            || customNewerThanBuild
 
         self.currentPreset = preset
         self.sharedDataDir = targetShared
@@ -378,11 +393,81 @@ final class RimeEngine {
         )
     }
 
+    /// Starts Rime against an isolated temporary `userDataDir` for CLI benchmarks and self-tests,
+    /// without touching the live user's `~/Library/InputType` profiles or `userdb`.
+    func startIsolated(preset: DictionaryPreset, sharedDataDir targetShared: String, userDataDir targetUser: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if isStarted, let api {
+            if sharedSessionId != 0 {
+                _ = api.pointee.destroy_session(sharedSessionId)
+                sharedSessionId = 0
+            }
+            api.pointee.finalize()
+            isStarted = false
+        }
+        try? FileManager.default.createDirectory(atPath: targetUser, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+
+        self.currentPreset = preset
+        self.sharedDataDir = targetShared
+        self.userDataDir = targetUser
+
+        guard let rimeApi = self.api ?? rime_get_api() else { return }
+        self.api = rimeApi
+
+        var traits = RimeTraits()
+        traits.data_size = Int32(MemoryLayout<RimeTraits>.size - MemoryLayout<Int32>.size)
+
+        targetShared.withCString { sharedCStr in
+            targetUser.withCString { userCStr in
+                logDir.withCString { logCStr in
+                    "InputType".withCString { distName in
+                        "InputType".withCString { distCode in
+                            "0.1.0".withCString { distVer in
+                                "rime.inputtype.bench".withCString { appName in
+                                    traits.shared_data_dir = sharedCStr
+                                    traits.user_data_dir = userCStr
+                                    traits.log_dir = logCStr
+                                    traits.distribution_name = distName
+                                    traits.distribution_code_name = distCode
+                                    traits.distribution_version = distVer
+                                    traits.app_name = appName
+
+                                    if !didSetupRime {
+                                        rimeApi.pointee.setup(&traits)
+                                        didSetupRime = true
+                                    }
+                                    rimeApi.pointee.initialize(&traits)
+                                    let started = rimeApi.pointee.start_maintenance(1) != 0
+                                    if started {
+                                        rimeApi.pointee.join_maintenance_thread()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sharedSessionId = 0
+        generation &+= 1
+        isStarted = true
+    }
+
     func selectCandidate(sessionId: RimeSessionId, index: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard let api, sessionId != 0, index >= 0 else { return false }
         return api.pointee.select_candidate(sessionId, index) != 0
+    }
+
+    @discardableResult
+    func deleteCandidate(sessionId: RimeSessionId, index: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, sessionId != 0, index >= 0, let delFn = api.pointee.delete_candidate else { return false }
+        return delFn(sessionId, index) != 0
     }
 
     func getAllCandidates(sessionId: RimeSessionId, limit: Int = 100) -> [RimeCandidateItem] {

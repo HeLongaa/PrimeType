@@ -1937,6 +1937,8 @@ extension Notification.Name {
 private struct AdvancedSettingsView: View {
     @ObservedObject var settings = InputSettings.shared
     @ObservedObject var clipboard = ClipboardManager.shared
+    @ObservedObject var grammarManager = GrammarModelManager.shared
+    @ObservedObject var neuralReranker = LocalNeuralReranker.shared
 
     @State private var selectedTab = 0
     @State private var statusBanner: (message: String, isError: Bool)?
@@ -1948,6 +1950,8 @@ private struct AdvancedSettingsView: View {
     @State private var micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
     @State private var localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
     @State private var isConfiguringLocalSign = false
+    @State private var latencySnapshot = LatencyProbe.shared.snapshot()
+    @State private var rankingEntryCount = UserRankingEngine.shared.entryCount
 
     var body: some View {
         ZStack {
@@ -1977,6 +1981,10 @@ private struct AdvancedSettingsView: View {
         }
         .onAppear {
             refreshPermissions()
+            latencySnapshot = LatencyProbe.shared.snapshot()
+            rankingEntryCount = UserRankingEngine.shared.entryCount
+            grammarManager.refreshInstalledModels()
+            neuralReranker.refreshInstallState()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshPermissions()
@@ -1984,6 +1992,8 @@ private struct AdvancedSettingsView: View {
         .onReceive(Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()) { _ in
             if selectedTab == 2 {
                 refreshPermissions()
+            } else if selectedTab == 3 {
+                latencySnapshot = LatencyProbe.shared.snapshot()
             }
         }
         .alert("确定重置个人词频？", isPresented: $showResetUserDBAlert) {
@@ -2220,8 +2230,132 @@ private struct AdvancedSettingsView: View {
                         subtitle: "拼音组词时输入「@」或「.」自动切换紧凑英文输入并提供常用邮箱与域名后缀补全"
                     )
                 }
+
+                Toggle(isOn: $settings.personalRankingEnabled) {
+                    SettingRowTitle(
+                        "个人反馈闭环与跨消息上下文",
+                        subtitle: "选中加权、上屏后 3 秒内删字强惩罚、30 天时间衰减与专词短时复现提权；组词时按 Shift+Delete 可永久移除误学词（当前已记录 \(rankingEntryCount) 条）"
+                    )
+                }
+
+                Toggle(isOn: $settings.typoCorrectionEnabled) {
+                    SettingRowTitle(
+                        "快打错键容错（Rime 原生）",
+                        subtitle: "自动容忍常见换位/邻键（如 zhognguo→中国）与双字母误连击（如 nihhao→你好），精确拼写始终优先"
+                    )
+                }
+
+                if rankingEntryCount > 0 {
+                    HStack(alignment: .center) {
+                        SettingRowTitle(
+                            "清空个人反馈排序记录",
+                            subtitle: "仅重置本地反馈加权与黑名单，不影响 Rime 词库与用户词频"
+                        )
+                        Spacer()
+                        Button("重置反馈") {
+                            UserRankingEngine.shared.resetAll()
+                            rankingEntryCount = 0
+                            showStatus("已清空个人反馈排序记录", isError: false)
+                        }
+                    }
+                }
             } header: {
                 Text("智能输入行为")
+            }
+
+            Section {
+                Toggle(isOn: $settings.grammarModelEnabled) {
+                    SettingRowTitle(
+                        "启用 Octagram 语法语言模型（.gram）",
+                        subtitle: "利用内置 librime-octagram 插件提升长句整句首选率（<1ms 延迟、mmap 只读共享，三套词库通用）"
+                    )
+                }
+
+                Picker("语法模型版本", selection: $settings.selectedGrammarModel) {
+                    ForEach(GrammarModelKind.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
+                }
+
+                HStack(alignment: .center) {
+                    let selected = settings.selectedGrammarModel
+                    let installed = grammarManager.installedModels.contains(selected)
+                    SettingRowTitle(
+                        installed ? "\(selected.shortName) 已安装" : "\(selected.shortName) 未下载（\(selected.approximateSizeLabel)）",
+                        subtitle: grammarManager.statusMessage.isEmpty
+                            ? (installed ? "已自动软链到所有词库方案，重启或部署后生效" : "按需下载至 ~/Library/InputType/models/，不占主安装包体积")
+                            : grammarManager.statusMessage
+                    )
+                    Spacer()
+                    if grammarManager.isDownloading {
+                        Button("取消") {
+                            grammarManager.cancelDownload()
+                        }
+                    } else if installed {
+                        Button("删除模型", role: .destructive) {
+                            grammarManager.deleteModel(selected)
+                        }
+                    } else {
+                        Button("下载并启用") {
+                            grammarManager.download(selected)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+
+                if grammarManager.isDownloading {
+                    ProgressView(value: grammarManager.progress)
+                        .progressViewStyle(.linear)
+                }
+            } header: {
+                Text("语法语言模型（Tier 0）")
+            }
+
+            Section {
+                Toggle(isOn: $settings.localRerankerEnabled) {
+                    SettingRowTitle(
+                        "启用端侧 AI 语境精排（Qwen2.5-0.5B · 可选）",
+                        subtitle: "长句（≥6 音节）或有前文语境时异步对 Top-6 整句做条件概率重排，150ms 首位保护不跳变，空闲 5 分钟自动卸载"
+                    )
+                }
+                .disabled(!neuralReranker.isInstalled)
+
+                HStack(alignment: .center) {
+                    SettingRowTitle(
+                        "本地模型状态：\(neuralReranker.runtimeState.rawValue)",
+                        subtitle: neuralReranker.statusMessage.isEmpty
+                            ? "独立子进程运行（llama-server Metal + Qwen2.5-0.5B-Q4，约 410 MB），绝不拖累主进程内存"
+                            : neuralReranker.statusMessage
+                    )
+                    Spacer()
+                    if neuralReranker.isDownloading {
+                        Button("取消") {
+                            neuralReranker.cancelDownload()
+                        }
+                    } else if neuralReranker.isInstalled {
+                        HStack(spacing: 8) {
+                            if neuralReranker.runtimeState == .running {
+                                Button("立即卸载") {
+                                    neuralReranker.unloadNow()
+                                }
+                            }
+                            Button("删除", role: .destructive) {
+                                neuralReranker.deleteModelAndRuntime()
+                            }
+                        }
+                    } else {
+                        Button("下载模型") {
+                            neuralReranker.downloadRuntimeAndModel()
+                        }
+                    }
+                }
+
+                if neuralReranker.isDownloading {
+                    ProgressView(value: neuralReranker.downloadProgress)
+                        .progressViewStyle(.linear)
+                }
+            } header: {
+                Text("端侧 AI 语境精排（Tier 2 · 可选）")
             }
 
             Section {
@@ -2299,6 +2433,29 @@ private struct AdvancedSettingsView: View {
                 }
             } header: {
                 Text("隐私清理")
+            }
+
+            Section {
+                HStack(alignment: .center) {
+                    SettingRowTitle(
+                        "击键响应延迟（16ms 帧预算监控）",
+                        subtitle: latencySnapshot.summaryText
+                    )
+                    Spacer()
+                    HStack(spacing: 8) {
+                        Button("刷新") {
+                            latencySnapshot = LatencyProbe.shared.snapshot()
+                        }
+                        if latencySnapshot.sampleCount > 0 {
+                            Button("清零") {
+                                LatencyProbe.shared.reset()
+                                latencySnapshot = .empty
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("实时性能打点")
             }
 
             Section {
@@ -2543,7 +2700,13 @@ private struct UpdatesSettingsView: View {
 
                     Spacer()
 
-                    if appUpdater.isChecking || appUpdater.isUpdating {
+                    if appUpdater.isUpdating {
+                        ProgressView()
+                            .controlSize(.small)
+                        Button("取消") {
+                            appUpdater.cancelUpdateDownload()
+                        }
+                    } else if appUpdater.isChecking {
                         ProgressView()
                             .controlSize(.small)
                     } else if appUpdater.hasUpdate {

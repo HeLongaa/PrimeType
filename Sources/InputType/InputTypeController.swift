@@ -20,9 +20,12 @@ final class InputTypeController: IMKInputController {
     private var currentPreedit: String = ""
     private var currentCandidates: [RimeCandidateItem] = []
     private var currentRimeCandidates: [RimeCandidateItem] = []
+    private var currentPresentedCandidates: [PresentedCandidate] = []
     private var currentDirectCommitTexts: Set<String> = []
     private var asciiComposingBuffer: String? = nil
     private var isVModeActive = false
+    private let queryCoordinator = QueryCoordinator(debounceMs: 45, timeoutMs: 200)
+    private let candidatePresenter = CandidatePresenter(lockFirstWindowSeconds: 0.15, top1LeadThreshold: 0.15)
 
     // Context trackers for smart spacing, symbol conversion, and auto-numbering
     private var lastCommittedChar: Character?
@@ -56,11 +59,14 @@ final class InputTypeController: IMKInputController {
     private func ensureValidSession() {
         let gen = RimeEngine.shared.generation
         if sessionId == 0 || engineGeneration != gen {
+            queryCoordinator.cancelAll()
+            candidatePresenter.reset()
             sessionId = RimeEngine.shared.sharedSession()
             engineGeneration = gen
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
             asciiComposingBuffer = nil
         }
@@ -71,12 +77,15 @@ final class InputTypeController: IMKInputController {
         let switchingController = Self.latestActiveController !== self
         ensureValidSession()
         if switchingController {
+            queryCoordinator.cancelAll()
+            candidatePresenter.reset()
             if sessionId != 0 {
                 RimeEngine.shared.clearComposition(sessionId: sessionId)
             }
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
             asciiComposingBuffer = nil
         }
@@ -102,6 +111,8 @@ final class InputTypeController: IMKInputController {
     }
 
     override func deactivateServer(_ sender: Any!) {
+        queryCoordinator.cancelAll()
+        candidatePresenter.reset()
         let wasActiveController = Self.latestActiveController === self
         if wasActiveController {
             let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
@@ -419,6 +430,8 @@ final class InputTypeController: IMKInputController {
     }
 
     override func cancelComposition() {
+        queryCoordinator.cancelAll()
+        candidatePresenter.reset()
         let targetClient = currentClient
         if isVModeActive {
             exitVMode(client: targetClient, clearMarked: true)
@@ -431,6 +444,7 @@ final class InputTypeController: IMKInputController {
         currentPreedit = ""
         currentCandidates = []
         currentRimeCandidates = []
+        currentPresentedCandidates = []
         currentDirectCommitTexts = []
         if hadMarked {
             clearMarkedText(client: targetClient)
@@ -440,6 +454,8 @@ final class InputTypeController: IMKInputController {
     }
 
     override func commitComposition(_ sender: Any!) {
+        queryCoordinator.cancelAll()
+        candidatePresenter.reset()
         let targetClient = sender as? (any IMKTextInput) ?? currentClient
         if isVModeActive {
             exitVMode(client: targetClient, clearMarked: true)
@@ -449,6 +465,7 @@ final class InputTypeController: IMKInputController {
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
             hideCandidatesImmediately()
             if !asciiBuffer.isEmpty {
@@ -463,6 +480,7 @@ final class InputTypeController: IMKInputController {
         guard hadPreedit || Self.latestActiveController === self else {
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
             return
         }
@@ -477,6 +495,7 @@ final class InputTypeController: IMKInputController {
         currentPreedit = ""
         currentCandidates = []
         currentRimeCandidates = []
+        currentPresentedCandidates = []
         currentDirectCommitTexts = []
         // Per Apple IMKTextInput contract, insertText already replaces marked text and unmarks it.
         // Only send setMarkedText("") when clearing an uncommitted composition.
@@ -522,6 +541,9 @@ final class InputTypeController: IMKInputController {
         }
 
         guard event.type == .keyDown else { return false }
+        let keystrokeStartAt = CFAbsoluteTimeGetCurrent()
+        candidatePresenter.noteKeystroke(now: keystrokeStartAt)
+        queryCoordinator.cancelAll()
         pendingCommandKeyCode = nil
 
         if VoiceInputManager.shared.handleKeyDownEvent(event) {
@@ -583,8 +605,10 @@ final class InputTypeController: IMKInputController {
         let modifiers = KeyCodeMapper.rimeModifiers(from: event.modifierFlags)
 
         let wasComposingBeforeKey = !currentPreedit.isEmpty
+        let rimeStart = CFAbsoluteTimeGetCurrent()
         let handled = RimeEngine.shared.processKey(sessionId: sessionId, keyCode: keyCode, mask: modifiers)
-        syncRimeState(client: client)
+        let rimeProcessMs = (CFAbsoluteTimeGetCurrent() - rimeStart) * 1000.0
+        syncRimeState(client: client, keystrokeStartAt: keystrokeStartAt, rimeProcessMs: rimeProcessMs)
 
         // macOS IMKInputController never delivers keyUp events. When Backspace clears the last
         // composing character, emit a synthetic BackSpace release so Lua processors (e.g. wanxiang
@@ -614,6 +638,11 @@ final class InputTypeController: IMKInputController {
         // enable_backspace_limit) can swallow Backspace and make deletion stop working (e.g. in Spotlight).
         if event.keyCode == 0x33 || event.keyCode == 0x75 {
             if event.keyCode == 0x33 && mods.isEmpty {
+                if settings.personalRankingEnabled {
+                    UserRankingEngine.shared.recordBackspaceAfterCommit(
+                        isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
+                    )
+                }
                 if !currentLineBuffer.isEmpty {
                     currentLineBuffer.removeLast()
                     lastCommittedChar = currentLineBuffer.last
@@ -621,10 +650,14 @@ final class InputTypeController: IMKInputController {
                     lastCommittedChar = nil
                 }
             } else {
+                UserRankingEngine.shared.noteNonDeleteActivity()
                 resetInputContextTracking()
             }
             return false
         }
+
+        // Non-delete key clears pending immediate-delete negative-feedback window
+        UserRankingEngine.shared.noteNonDeleteActivity()
 
         // Navigation, Escape, and Tab keys when NOT composing pass straight through to the host app
         if [0x7b, 0x7c, 0x7d, 0x7e, 0x73, 0x77, 0x74, 0x79, 0x35, 0x30].contains(event.keyCode) {
@@ -785,12 +818,18 @@ final class InputTypeController: IMKInputController {
         if allowAutoPair, let closing = InputSettings.shared.closingPair(for: text) {
             insertRawText(output + closing, client: client)
             updateTracking(appending: output)
+            if InputSettings.shared.personalRankingEnabled {
+                EmitHistory.shared.recordCommit(output, bundleID: client?.bundleIdentifier())
+            }
             moveCaretLeftOnce()
             return
         }
 
         insertRawText(output, client: client)
         updateTracking(appending: output)
+        if InputSettings.shared.personalRankingEnabled {
+            EmitHistory.shared.recordCommit(output, bundleID: client?.bundleIdentifier())
+        }
     }
 
     private func insertRawText(_ text: String, client: (any IMKTextInput)?) {
@@ -1600,18 +1639,35 @@ final class InputTypeController: IMKInputController {
     }
 
     private func expandCandidates(_ candidatesWin: IMKCandidates) {
-        if asciiComposingBuffer == nil && !currentPreedit.isEmpty && currentRimeCandidates.count <= 36 {
-            let expanded = RimeEngine.shared.getAllCandidates(sessionId: sessionId, limit: 160)
-            if expanded.count > currentRimeCandidates.count {
-                currentRimeCandidates = expanded
-                if currentDirectCommitTexts.isEmpty {
-                    currentCandidates = expanded
-                } else {
-                    let prefixItems = currentCandidates.filter { currentDirectCommitTexts.contains($0.text) }
-                    let filteredRime = expanded.filter { !currentDirectCommitTexts.contains($0.text) }
-                    currentCandidates = prefixItems + filteredRime
+        if asciiComposingBuffer == nil && !currentPreedit.isEmpty {
+            let sylCount = CandidatePipeline.syllableCount(from: currentPreedit)
+            let expandedLimit = CandidatePipeline.adaptiveFetchLimit(syllableCount: sylCount, isExpanded: true)
+            if currentRimeCandidates.count < expandedLimit {
+                let expanded = RimeEngine.shared.getAllCandidates(sessionId: sessionId, limit: expandedLimit)
+                if expanded.count > currentRimeCandidates.count {
+                    currentRimeCandidates = expanded
+                    let prefixItems = currentPresentedCandidates
+                        .filter(\.isDirectCommit)
+                        .map { RimeCandidateItem(text: $0.text, comment: $0.comment) }
+                    var built = CandidatePipeline.buildCandidates(
+                        rimeCandidates: expanded,
+                        directPrefixItems: prefixItems,
+                        syllableCount: sylCount
+                    )
+                    if InputSettings.shared.personalRankingEnabled {
+                        let code = UserRankingEngine.normalizeCode(currentPreedit)
+                        let bundleID = currentClient?.bundleIdentifier()
+                        built = UserRankingEngine.shared.rerank(
+                            candidates: built,
+                            code: code,
+                            emitBoostForWord: { EmitHistory.shared.entityMatchBoost(for: $0, bundleID: bundleID) }
+                        )
+                    }
+                    currentPresentedCandidates = built
+                    currentCandidates = built.map { RimeCandidateItem(text: $0.text, comment: $0.comment) }
+                    candidatePresenter.presentSync(preedit: currentPreedit, candidates: built)
+                    candidatesWin.update()
                 }
-                candidatesWin.update()
             }
         }
         let sel = Selector(("expand"))
@@ -1728,6 +1784,14 @@ final class InputTypeController: IMKInputController {
                 expandCandidates(candidatesWin)
             }
             return true
+        }
+
+        // Shift + Backspace / Shift + Forward Delete -> remove highlighted mis-learned candidate from userdb & blacklist
+        if hasShift && (event.keyCode == 0x33 || event.keyCode == 0x75) {
+            if let highlightedText = currentlyHighlightedCandidateText(candidatesWin) {
+                deleteHighlightedCandidate(withText: highlightedText, client: client)
+                return true
+            }
         }
 
         guard !hasShift else { return nil }
@@ -1872,14 +1936,32 @@ final class InputTypeController: IMKInputController {
         }
     }
 
+    private func deleteHighlightedCandidate(withText text: String, client: (any IMKTextInput)?) {
+        guard !text.isEmpty else { return }
+        let code = UserRankingEngine.normalizeCode(currentPreedit)
+        if let presented = currentPresentedCandidates.first(where: { $0.text == text }),
+           let rimeIdx = presented.originalRimeIndex {
+            _ = RimeEngine.shared.deleteCandidate(sessionId: sessionId, index: rimeIdx)
+        } else if let fallbackIdx = currentRimeCandidates.firstIndex(where: { $0.text == text }) {
+            _ = RimeEngine.shared.deleteCandidate(sessionId: sessionId, index: fallbackIdx)
+        }
+        if !code.isEmpty {
+            UserRankingEngine.shared.blacklist(code: code, word: text)
+        }
+        syncRimeState(client: client)
+    }
+
     private func commitCandidate(withText text: String, client: (any IMKTextInput)?) {
+        queryCoordinator.cancelAll()
         if asciiComposingBuffer != nil || currentDirectCommitTexts.contains(text) {
             asciiComposingBuffer = nil
             RimeEngine.shared.clearComposition(sessionId: sessionId)
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
+            candidatePresenter.reset()
             hideCandidatesImmediately()
             if !text.isEmpty {
                 insertProcessedText(text, client: client, allowAutoPair: false)
@@ -1889,7 +1971,31 @@ final class InputTypeController: IMKInputController {
             return
         }
 
-        let index = currentRimeCandidates.firstIndex(where: { $0.text == text }) ?? 0
+        let codeBeforeCommit = UserRankingEngine.normalizeCode(currentPreedit)
+        let displayedRank = currentPresentedCandidates.firstIndex(where: { $0.text == text }) ?? 0
+        let skippedTopWords: [String] = displayedRank > 0
+            ? Array(currentPresentedCandidates.prefix(min(displayedRank, 3)).map(\.text))
+            : []
+
+        // Always map displayed candidate back to its exact original Rime index so userdb & segmented commits stay intact
+        let index: Int
+        if let presented = currentPresentedCandidates.first(where: { $0.text == text }),
+           let originalIdx = presented.originalRimeIndex {
+            index = originalIdx
+        } else {
+            index = currentRimeCandidates.firstIndex(where: { $0.text == text }) ?? 0
+        }
+
+        if InputSettings.shared.personalRankingEnabled && !codeBeforeCommit.isEmpty {
+            UserRankingEngine.shared.recordSelection(
+                code: codeBeforeCommit,
+                word: text,
+                rank: displayedRank,
+                skippedTopWords: skippedTopWords,
+                isWanxiangPreset: RimeEngine.shared.currentPreset == .wanxiang
+            )
+        }
+
         if RimeEngine.shared.selectCandidate(sessionId: sessionId, index: index) {
             syncRimeState(client: client)
         }
@@ -2393,7 +2499,11 @@ final class InputTypeController: IMKInputController {
         return false
     }
 
-    private func syncRimeState(client: (any IMKTextInput)?) {
+    private func syncRimeState(
+        client: (any IMKTextInput)?,
+        keystrokeStartAt: CFAbsoluteTime? = nil,
+        rimeProcessMs: Double = 0
+    ) {
         // Pure Pinyin input method: ensure ascii_mode never gets enabled by any Rime keybinding
         if RimeEngine.shared.isAsciiMode(sessionId: sessionId) {
             RimeEngine.shared.setAsciiMode(sessionId: sessionId, enabled: false)
@@ -2411,7 +2521,10 @@ final class InputTypeController: IMKInputController {
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
+            candidatePresenter.reset()
+            queryCoordinator.cancelAll()
             // insertText already replaces marked text and exits composition mode;
             // calling setMarkedText("") afterward violates IMKTextInput and breaks Backspace
             // in strict NSTextView / Spotlight / WKWebView clients (e.g. Gemini Mac app).
@@ -2427,7 +2540,10 @@ final class InputTypeController: IMKInputController {
             currentPreedit = ""
             currentCandidates = []
             currentRimeCandidates = []
+            currentPresentedCandidates = []
             currentDirectCommitTexts = []
+            candidatePresenter.reset()
+            queryCoordinator.cancelAll()
             if hadPreedit && !didCommit {
                 clearMarkedText(client: client)
             }
@@ -2437,15 +2553,19 @@ final class InputTypeController: IMKInputController {
             currentPreedit = context.preedit
             updateMarkedText(context, client: client)
 
-            let fetchLimit = (AppDelegate.sharedCandidates.map { isCandidatesExpanded($0) } ?? false) ? 160 : 36
+            // Tier 0: Adaptive Rime lazy-fetch budget based on real syllable count
+            let syllableCount = CandidatePipeline.syllableCount(from: context.preedit)
+            let isExpanded = AppDelegate.sharedCandidates.map { isCandidatesExpanded($0) } ?? false
+            let fetchLimit = CandidatePipeline.adaptiveFetchLimit(syllableCount: syllableCount, isExpanded: isExpanded)
+
+            let fetchStart = CFAbsoluteTimeGetCurrent()
             let rimeCandidates = RimeEngine.shared.getAllCandidates(sessionId: sessionId, limit: fetchLimit)
+            let fetchMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000.0
             currentRimeCandidates = rimeCandidates
 
-            // Merge matching custom phrases (and V-mode clipboard/phrase shortcuts) at the top
-            let normalizedQuery = context.preedit
-                .replacingOccurrences(of: " ", with: "")
-                .replacingOccurrences(of: "'", with: "")
-                .lowercased()
+            // Tier 1: Direct custom phrases + semantic deduplication + personal feedback & cross-message entity boost
+            let tier1Start = CFAbsoluteTimeGetCurrent()
+            let normalizedQuery = UserRankingEngine.normalizeCode(context.preedit)
 
             var extraItems: [RimeCandidateItem] = []
             var directTexts: Set<String> = []
@@ -2476,12 +2596,25 @@ final class InputTypeController: IMKInputController {
             }
 
             currentDirectCommitTexts = directTexts
-            if extraItems.isEmpty {
-                currentCandidates = rimeCandidates
-            } else {
-                let filteredRime = rimeCandidates.filter { !directTexts.contains($0.text) }
-                currentCandidates = extraItems + filteredRime
+
+            var presented = CandidatePipeline.buildCandidates(
+                rimeCandidates: rimeCandidates,
+                directPrefixItems: extraItems,
+                syllableCount: syllableCount
+            )
+            let bundleID = client?.bundleIdentifier()
+            if InputSettings.shared.personalRankingEnabled {
+                presented = UserRankingEngine.shared.rerank(
+                    candidates: presented,
+                    code: normalizedQuery,
+                    emitBoostForWord: { EmitHistory.shared.entityMatchBoost(for: $0, bundleID: bundleID) }
+                )
             }
+            let tier1Ms = (CFAbsoluteTimeGetCurrent() - tier1Start) * 1000.0
+
+            currentPresentedCandidates = presented
+            currentCandidates = presented.map { RimeCandidateItem(text: $0.text, comment: $0.comment) }
+            candidatePresenter.presentSync(preedit: context.preedit, candidates: presented)
 
             if let candidatesWin = AppDelegate.sharedCandidates {
                 if currentCandidates.isEmpty {
@@ -2508,6 +2641,55 @@ final class InputTypeController: IMKInputController {
                     }
                     NSAnimationContext.endGrouping()
                 }
+            }
+
+            if let t0 = keystrokeStartAt {
+                let totalSyncMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+                LatencyProbe.shared.recordSync(
+                    totalMs: totalSyncMs,
+                    rimeMs: rimeProcessMs + fetchMs,
+                    tier1Ms: tier1Ms
+                )
+            }
+
+            // Tier 2: Optional cancellable async neural reranking (long sentences / contextual ambiguity)
+            let contextPrefix = InputSettings.shared.personalRankingEnabled
+                ? EmitHistory.shared.recentContext(forBundleID: bundleID, maxChars: 80)
+                : ""
+            if LocalNeuralReranker.shared.shouldTrigger(
+                syllableCount: syllableCount,
+                candidates: presented,
+                contextPrefix: contextPrefix
+            ) {
+                let snapshotPreedit = context.preedit
+                let snapshotCandidates = presented
+                let snapshotCode = normalizedQuery
+                queryCoordinator.schedule(
+                    work: {
+                        await LocalNeuralReranker.shared.rerank(
+                            preedit: snapshotPreedit,
+                            candidates: snapshotCandidates,
+                            contextPrefix: contextPrefix,
+                            normalizedCode: snapshotCode
+                        )
+                    },
+                    onResult: { [weak self] result, asyncMs in
+                        guard let self, self.currentPreedit == result.preedit else { return }
+                        let outcome = self.candidatePresenter.presentAsync(
+                            preedit: result.preedit,
+                            reranked: result.candidates,
+                            leadMargin: result.leadMargin
+                        )
+                        LatencyProbe.shared.recordAsyncApplied(ms: asyncMs, flippedTop1: outcome.flippedTop1)
+                        if outcome.didChange {
+                            self.currentPresentedCandidates = self.candidatePresenter.currentCandidates
+                            self.currentCandidates = self.currentPresentedCandidates.map {
+                                RimeCandidateItem(text: $0.text, comment: $0.comment)
+                            }
+                            AppDelegate.sharedCandidates?.update()
+                        }
+                    }
+                )
             }
         }
     }

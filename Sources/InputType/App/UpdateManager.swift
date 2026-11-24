@@ -98,6 +98,25 @@ final class AppUpdateManager: ObservableObject {
         }
     }
 
+    private var activeUpdateTask: Task<Void, Never>?
+    private static var activeDownloadSession: URLSession?
+    private static let downloadSessionLock = NSLock()
+
+    func cancelUpdateDownload() {
+        activeUpdateTask?.cancel()
+        activeUpdateTask = nil
+        Self.downloadSessionLock.lock()
+        let session = Self.activeDownloadSession
+        Self.activeDownloadSession = nil
+        Self.downloadSessionLock.unlock()
+        session?.invalidateAndCancel()
+        DispatchQueue.main.async {
+            self.isUpdating = false
+            self.downloadProgress = 0
+            self.statusMessage = "已取消更新下载"
+        }
+    }
+
     func downloadAndInstallUpdate() {
         guard !isUpdating, let urlStr = assetDownloadURL, let url = URL(string: urlStr) else {
             if let url = URL(string: releaseURL) {
@@ -109,7 +128,7 @@ final class AppUpdateManager: ObservableObject {
         downloadProgress = 0.05
         statusMessage = "正在下载更新包…"
 
-        Task.detached(priority: .userInitiated) {
+        activeUpdateTask = Task.detached(priority: .userInitiated) {
             let fm = FileManager.default
             let tmpDir = fm.temporaryDirectory.appendingPathComponent("PrimeTypeUpdate-\(UUID().uuidString)", isDirectory: true)
             do {
@@ -304,6 +323,9 @@ final class AppUpdateManager: ObservableObject {
 
         let delegate = DownloadDelegate(onProgress: onProgress)
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        downloadSessionLock.withLock {
+            activeDownloadSession = session
+        }
         return try await withCheckedThrowingContinuation { cont in
             delegate.continuation = cont
             let task = session.downloadTask(with: request)

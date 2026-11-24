@@ -515,6 +515,11 @@ private struct PersistedSettings: Codable {
 
     // Advanced
     var smartEmailURLCompletion: Bool = true
+    var grammarModelEnabled: Bool = true
+    var selectedGrammarModel: GrammarModelKind = .lightweight
+    var typoCorrectionEnabled: Bool = true
+    var personalRankingEnabled: Bool = true
+    var localRerankerEnabled: Bool = false
 
     init() {}
 
@@ -593,6 +598,11 @@ private struct PersistedSettings: Codable {
         lastLaunchedVersion = try c.decodeIfPresent(String.self, forKey: .lastLaunchedVersion) ?? ""
         autoUpdateDictionaries = try c.decodeIfPresent(Bool.self, forKey: .autoUpdateDictionaries) ?? false
         smartEmailURLCompletion = try c.decodeIfPresent(Bool.self, forKey: .smartEmailURLCompletion) ?? true
+        grammarModelEnabled = try c.decodeIfPresent(Bool.self, forKey: .grammarModelEnabled) ?? true
+        selectedGrammarModel = try c.decodeIfPresent(GrammarModelKind.self, forKey: .selectedGrammarModel) ?? .lightweight
+        typoCorrectionEnabled = try c.decodeIfPresent(Bool.self, forKey: .typoCorrectionEnabled) ?? true
+        personalRankingEnabled = try c.decodeIfPresent(Bool.self, forKey: .personalRankingEnabled) ?? true
+        localRerankerEnabled = try c.decodeIfPresent(Bool.self, forKey: .localRerankerEnabled) ?? false
     }
 }
 
@@ -693,6 +703,18 @@ final class InputSettings: ObservableObject {
 
     // Advanced
     @Published var smartEmailURLCompletion: Bool { didSet { save() } }
+    @Published var grammarModelEnabled: Bool { didSet { save(); scheduleRimeSync() } }
+    @Published var selectedGrammarModel: GrammarModelKind { didSet { save(); scheduleRimeSync() } }
+    @Published var typoCorrectionEnabled: Bool { didSet { save(); scheduleRimeSync() } }
+    @Published var personalRankingEnabled: Bool { didSet { save() } }
+    @Published var localRerankerEnabled: Bool {
+        didSet {
+            save()
+            if !localRerankerEnabled {
+                LocalNeuralReranker.shared.unloadNow()
+            }
+        }
+    }
 
     private let settingsURL: URL
     private var isLoading = false
@@ -772,6 +794,11 @@ final class InputSettings: ObservableObject {
         self.lastLaunchedVersion = loaded.lastLaunchedVersion
         self.autoUpdateDictionaries = loaded.autoUpdateDictionaries
         self.smartEmailURLCompletion = loaded.smartEmailURLCompletion
+        self.grammarModelEnabled = loaded.grammarModelEnabled
+        self.selectedGrammarModel = loaded.selectedGrammarModel
+        self.typoCorrectionEnabled = loaded.typoCorrectionEnabled
+        self.personalRankingEnabled = loaded.personalRankingEnabled
+        self.localRerankerEnabled = loaded.localRerankerEnabled
 
         self.isLoading = false
     }
@@ -900,6 +927,11 @@ final class InputSettings: ObservableObject {
         payload.lastLaunchedVersion = lastLaunchedVersion
         payload.autoUpdateDictionaries = autoUpdateDictionaries
         payload.smartEmailURLCompletion = smartEmailURLCompletion
+        payload.grammarModelEnabled = grammarModelEnabled
+        payload.selectedGrammarModel = selectedGrammarModel
+        payload.typoCorrectionEnabled = typoCorrectionEnabled
+        payload.personalRankingEnabled = personalRankingEnabled
+        payload.localRerankerEnabled = localRerankerEnabled
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1032,17 +1064,56 @@ final class InputSettings: ObservableObject {
             lines.append("  super_processor/enable_backspace_limit: false")
         }
 
+        // Tier-0: Activate bundled librime-octagram plugin across all presets whenever a .gram model is installed
+        GrammarModelManager.shared.ensureSymlinks(in: profileDir.path)
+        if let gramLang = GrammarModelManager.shared.activeGrammarLanguage(
+            preferred: selectedGrammarModel,
+            enabled: grammarModelEnabled
+        ) {
+            lines.append("  grammar/language: \(gramLang)")
+            lines.append("  grammar/collocation_max_length: 6")
+            lines.append("  grammar/collocation_min_length: 2")
+            lines.append("  grammar/collocation_penalty: -14")
+            lines.append("  grammar/non_collocation_penalty: -6")
+            lines.append("  grammar/weak_collocation_penalty: -100")
+            lines.append("  grammar/rear_penalty: -18")
+            lines.append("  translator/contextual_suggestions: true")
+            lines.append("  translator/max_homophones: 7")
+        }
+
+        // Combine fuzzy pinyin + safe zero-collision Rime native typo correction rules
+        var extraAlgebra: [String] = []
         if fuzzyPinyinEnabled && !fuzzyRules.isEmpty {
-            lines.append("  speller/algebra/+:")
             for rule in FuzzyPinyinRule.allCases where fuzzyRules.contains(rule) {
-                for expr in rule.algebraRules {
-                    lines.append("    - \(expr)")
-                }
+                extraAlgebra.append(contentsOf: rule.algebraRules)
+            }
+        }
+        if typoCorrectionEnabled {
+            // Zero-collision typo derivations (derived forms cannot collide with valid Mandarin syllables):
+            // - gn / mg transposition/adjacent-key for -ng finals (e.g. zhognguo -> 中国, zhemgchang -> 正常)
+            // - ina / una transposition for -ian / -uan finals
+            // - doubled initial consonant dedup (e.g. nihhao -> 你好)
+            extraAlgebra.append(contentsOf: [
+                "derive/([aoei])ng$/$1gn/",
+                "derive/([aoei])ng$/$1mg/",
+                "derive/ian$/ina/",
+                "derive/uan$/una/",
+                "derive/^([bpmfdtnlgkhjqxzcsw])/$1$1/"
+            ])
+        }
+        if !extraAlgebra.isEmpty {
+            lines.append("  speller/algebra/+:")
+            for expr in extraAlgebra {
+                lines.append("    - \(expr)")
             }
         }
 
         let yaml = lines.joined(separator: "\n") + "\n"
         try? yaml.write(to: schemaCustomURL, atomically: true, encoding: .utf8)
+    }
+
+    func redeployCurrentPreset() {
+        scheduleRimeSync()
     }
 
     private func scheduleRimeSync() {
@@ -1154,6 +1225,11 @@ final class InputSettings: ObservableObject {
         lastLaunchedVersion = loaded.lastLaunchedVersion
         autoUpdateDictionaries = loaded.autoUpdateDictionaries
         smartEmailURLCompletion = loaded.smartEmailURLCompletion
+        grammarModelEnabled = loaded.grammarModelEnabled
+        selectedGrammarModel = loaded.selectedGrammarModel
+        typoCorrectionEnabled = loaded.typoCorrectionEnabled
+        personalRankingEnabled = loaded.personalRankingEnabled
+        localRerankerEnabled = loaded.localRerankerEnabled
     }
 
     func exportBackupArchive(to destinationURL: URL) throws {
@@ -1261,6 +1337,11 @@ final class InputSettings: ObservableObject {
         Custom Phrases: \(customPhrases.count)
         Clipboard Entries: \(ClipboardManager.shared.entries.count)
         Smart Email/URL Completion: \(smartEmailURLCompletion)
+        Grammar Model Enabled: \(grammarModelEnabled) (\(selectedGrammarModel.rawValue))
+        Typo Correction Enabled: \(typoCorrectionEnabled)
+        Personal Ranking Enabled: \(personalRankingEnabled)
+        Local Neural Reranker Enabled: \(localRerankerEnabled)
+        Latency Telemetry: \(LatencyProbe.shared.snapshot().summaryText)
         Voice Channel: \(voicePrimaryChannel.rawValue)
         """
         try summary.write(to: staging.appendingPathComponent("system_info.txt"), atomically: true, encoding: .utf8)
