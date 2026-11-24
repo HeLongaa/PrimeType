@@ -334,6 +334,20 @@ final class RimeEngine {
         return String(cString: cStr)
     }
 
+    func getCaretPos(sessionId: RimeSessionId) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, sessionId != 0, let getPos = api.pointee.get_caret_pos else { return 0 }
+        return Int(getPos(sessionId))
+    }
+
+    func setCaretPos(sessionId: RimeSessionId, pos: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, sessionId != 0, let setPos = api.pointee.set_caret_pos else { return }
+        setPos(sessionId, max(0, pos))
+    }
+
     @discardableResult
     func setRawInput(sessionId: RimeSessionId, input: String) -> Bool {
         lock.lock()

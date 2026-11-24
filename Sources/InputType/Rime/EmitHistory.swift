@@ -99,7 +99,7 @@ final class EmitHistory {
         guard count >= 2 && count <= 6 else { return 0.0 }
         let ctx = recentContext(forBundleID: bundleID, maxChars: maxContextChars, now: now, bypassSecureCheck: bypassSecureCheck)
         guard !ctx.isEmpty else { return 0.0 }
-        return ctx.contains(candidateText) ? 0.8 : 0.0
+        return ctx.contains(candidateText) ? 0.35 : 0.0
     }
 
     func clearAll() {

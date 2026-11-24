@@ -122,6 +122,26 @@ if CommandLine.arguments.contains("--self-test-experience") {
         "ClipboardManager filters sensitive password manager pasteboard types"
     )
 
+    // 8. Preedit syllable-left boundary navigation (da dao zhe li -> jumps by syllable boundaries)
+    let raw = "dadaozheli"
+    let pre = "da dao zhe li"
+    let p1 = InputTypeController.previousSyllableBoundary(rawInput: raw, preedit: pre, currentCaret: 10)
+    let p2 = InputTypeController.previousSyllableBoundary(rawInput: raw, preedit: pre, currentCaret: p1)
+    let p3 = InputTypeController.previousSyllableBoundary(rawInput: raw, preedit: pre, currentCaret: p2)
+    let p4 = InputTypeController.previousSyllableBoundary(rawInput: raw, preedit: pre, currentCaret: p3)
+    let pMid = InputTypeController.previousSyllableBoundary(rawInput: raw, preedit: pre, currentCaret: 6)
+    assertCheck(p1 == 8 && p2 == 5 && p3 == 2 && p4 == 0 && pMid == 5, "Preedit Left Arrow jumps cleanly across syllable boundaries")
+
+    // 9. Smoothed UserRankingEngine: 1 single accidental select of #2 does NOT immediately hijack #1
+    let calmRanking = UserRankingEngine(storageURL: nil, persistEnabled: false)
+    calmRanking.recordSelection(code: "dadao", word: "打到", rank: 1, skippedTopWords: ["达到"], now: t0, bypassSecureCheck: true)
+    let calmCands = [
+        PresentedCandidate(text: "达到", comment: nil, originalRimeIndex: 0, isDirectCommit: false, isWholeSentence: true, baseRank: 0),
+        PresentedCandidate(text: "打到", comment: nil, originalRimeIndex: 1, isDirectCommit: false, isWholeSentence: true, baseRank: 1)
+    ]
+    let afterOnePick = calmRanking.rerank(candidates: calmCands, code: "dadao", now: t0 + 1)
+    assertCheck(afterOnePick.first?.text == "达到", "Smoothed UserRankingEngine does not overreact to a single selection")
+
     print(failures.isEmpty ? "SELF_TEST_ALL_PASSED" : "SELF_TEST_FAILED: \(failures.joined(separator: ", "))")
     exit(failures.isEmpty ? 0 : 1)
 }

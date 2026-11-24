@@ -21,9 +21,9 @@ final class LocalNeuralReranker: NSObject, ObservableObject {
 
     enum RuntimeState: String {
         case notInstalled = "未下载"
-        case idleUnloaded = "已就绪（空闲休眠，0 MB 显存）"
-        case starting = "正在按需加载模型…"
-        case running = "运行中（Metal 加速）"
+        case idleUnloaded = "已就绪（空闲休眠）"
+        case starting = "正在加载模型…"
+        case running = "运行中"
     }
 
     @Published private(set) var runtimeState: RuntimeState = .notInstalled

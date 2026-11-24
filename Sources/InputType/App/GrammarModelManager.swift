@@ -228,7 +228,9 @@ final class GrammarModelManager: NSObject, ObservableObject, URLSessionDownloadD
                 self.statusMessage = "\(kind.shortName) 安装完成，正在重新部署 Rime…"
                 InputSettings.shared.selectedGrammarModel = kind
                 InputSettings.shared.grammarModelEnabled = true
-                InputSettings.shared.redeployCurrentPreset()
+                InputSettings.shared.redeployCurrentPreset {
+                    self.statusMessage = "\(kind.shortName) 已部署并生效"
+                }
             }
         } catch {
             DispatchQueue.main.async {

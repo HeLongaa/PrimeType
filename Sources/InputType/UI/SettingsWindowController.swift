@@ -2240,7 +2240,7 @@ private struct AdvancedSettingsView: View {
 
                 Toggle(isOn: $settings.typoCorrectionEnabled) {
                     SettingRowTitle(
-                        "快打错键容错（Rime 原生）",
+                        "快打容错",
                         subtitle: "自动容忍常见换位/邻键（如 zhognguo→中国）与双字母误连击（如 nihhao→你好），精确拼写始终优先"
                     )
                 }
@@ -2266,8 +2266,8 @@ private struct AdvancedSettingsView: View {
             Section {
                 Toggle(isOn: $settings.grammarModelEnabled) {
                     SettingRowTitle(
-                        "启用 Octagram 语法语言模型（.gram）",
-                        subtitle: "利用内置 librime-octagram 插件提升长句整句首选率（<1ms 延迟、mmap 只读共享，三套词库通用）"
+                        "启用语法模型",
+                        subtitle: "利用内置语法模型提升长句整句首选率"
                     )
                 }
 
@@ -2308,14 +2308,14 @@ private struct AdvancedSettingsView: View {
                         .progressViewStyle(.linear)
                 }
             } header: {
-                Text("语法语言模型（Tier 0）")
+                Text("语法模型")
             }
 
             Section {
                 Toggle(isOn: $settings.localRerankerEnabled) {
                     SettingRowTitle(
-                        "启用端侧 AI 语境精排（Qwen2.5-0.5B · 可选）",
-                        subtitle: "长句（≥6 音节）或有前文语境时异步对 Top-6 整句做条件概率重排，150ms 首位保护不跳变，空闲 5 分钟自动卸载"
+                        "启用端侧模型语境精排（可选）",
+                        subtitle: "长句或有前文语境时对候选词进行重新排序"
                     )
                 }
                 .disabled(!neuralReranker.isInstalled)
@@ -2323,9 +2323,7 @@ private struct AdvancedSettingsView: View {
                 HStack(alignment: .center) {
                     SettingRowTitle(
                         "本地模型状态：\(neuralReranker.runtimeState.rawValue)",
-                        subtitle: neuralReranker.statusMessage.isEmpty
-                            ? "独立子进程运行（llama-server Metal + Qwen2.5-0.5B-Q4，约 410 MB），绝不拖累主进程内存"
-                            : neuralReranker.statusMessage
+                        subtitle: neuralReranker.statusMessage.isEmpty ? nil : neuralReranker.statusMessage
                     )
                     Spacer()
                     if neuralReranker.isDownloading {
@@ -2355,7 +2353,7 @@ private struct AdvancedSettingsView: View {
                         .progressViewStyle(.linear)
                 }
             } header: {
-                Text("端侧 AI 语境精排（Tier 2 · 可选）")
+                Text("端侧模型语境精排（可选）")
             }
 
             Section {

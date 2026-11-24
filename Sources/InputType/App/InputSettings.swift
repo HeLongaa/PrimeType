@@ -1112,8 +1112,18 @@ final class InputSettings: ObservableObject {
         try? yaml.write(to: schemaCustomURL, atomically: true, encoding: .utf8)
     }
 
-    func redeployCurrentPreset() {
-        scheduleRimeSync()
+    func redeployCurrentPreset(completion: (() -> Void)? = nil) {
+        let preset = selectedDictionary
+        rimeSyncWorkItem?.cancel()
+        rimeSyncQueue.async { [weak self] in
+            self?.writeRimeCustomYAML(for: preset)
+            RimeEngine.shared.deploy(waitForMaintenance: true)
+            if let completion {
+                DispatchQueue.main.async {
+                    completion()
+                }
+            }
+        }
     }
 
     private func scheduleRimeSync() {

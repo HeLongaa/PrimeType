@@ -41,19 +41,21 @@ final class UserRankingEngine {
     private var pendingCommit: PendingCommitContext?
     private var saveWorkItem: DispatchWorkItem?
 
-    // Tuning constants aligned with v2 spec
-    static let selectTop1Bonus: Double = 1.0
-    static let selectOtherBonus: Double = 0.6
-    static let skippedCandidatePenalty: Double = -0.25
-    static let deleteAfterCommitPenalty: Double = -5.0
-    static let reselectExtraPenalty: Double = -3.0 // Total -8.0 with delete penalty
-    static let reselectWinnerBonus: Double = 2.0
+    // Smoothed tuning constants: avoid aggressive jumps on accidental selections or single typos,
+    // while 3 consecutive mis-select+deletes still reliably sink a bad word out of Top-3 for 10 days.
+    static let selectTop1Bonus: Double = 0.6
+    static let selectOtherBonus: Double = 0.45
+    static let skippedCandidatePenalty: Double = -0.10
+    static let deleteAfterCommitPenalty: Double = -2.4
+    static let reselectExtraPenalty: Double = -1.8 // Total -4.2 with delete penalty
+    static let reselectWinnerBonus: Double = 1.2
     static let blacklistScore: Double = -50.0
     static let deleteWindowSeconds: TimeInterval = 3.0
     static let reselectWindowSeconds: TimeInterval = 5.0
     static let regularHalfLifeDays: Double = 30.0
     static let selfMadeHalfLifeDays: Double = 14.0
     static let pruneThreshold: Double = 0.03
+    static let top1SwapInertia: Double = 0.35
 
     init(storageURL: URL? = nil, persistEnabled: Bool = true) {
         if let storageURL {
@@ -272,7 +274,7 @@ final class UserRankingEngine {
             return (Self.blacklistScore, true)
         }
         let pairScore = pairStat.map { Self.decayedScore(for: $0, now: now) } ?? 0.0
-        let globalScore = wordStat.map { Self.decayedScore(for: $0, now: now) * 0.25 } ?? 0.0
+        let globalScore = wordStat.map { Self.decayedScore(for: $0, now: now) * 0.12 } ?? 0.0
         return (pairScore + globalScore, false)
     }
 
@@ -335,24 +337,38 @@ final class UserRankingEngine {
             if userScore != 0 || contextBoost != 0 || blacklisted {
                 hasAnySignal = true
             }
-            // Rank prior decreases smoothly (~3.0 -> 0.5) so mild positive signals gently promote,
-            // while strong negative feedback (-5.0 / -8.0 / -50.0) reliably sinks mis-selected words below Top-3.
+            // Rank prior decreases smoothly (~3.0 -> 0.5). Moderate user multiplier (0.35) prevents
+            // a single accidental click or typo from flipping rankings too aggressively.
             let rankPrior = 6.0 / Double(2 + pos)
-            let clampedUser = max(-60.0, min(8.0, userScore * 0.55))
+            let clampedUser = max(-60.0, min(6.0, userScore * 0.35))
             let total = rankPrior + clampedUser + contextBoost
             scored.append((cand, total, pos, blacklisted))
         }
 
         guard hasAnySignal else { return candidates }
 
-        let visible = scored.filter { !$0.blacklisted }
+        var sortedVisible = scored.filter { !$0.blacklisted }
             .sorted { a, b in
                 if abs(a.score - b.score) > 1e-6 {
                     return a.score > b.score
                 }
                 return a.originalPos < b.originalPos
             }
-            .map(\.cand)
+
+        // Top-1 inertia: unless the original #1 was negatively penalized or beaten by a clear margin (+0.35),
+        // keep original #1 in slot 0 to avoid jittery ordering changes.
+        if sortedVisible.count >= 2,
+           let origTopEntry = sortedVisible.first(where: { $0.originalPos == 0 }),
+           sortedVisible[0].originalPos != 0 {
+            let lead = sortedVisible[0].score - origTopEntry.score
+            let (origUserScore, _) = effectiveScore(code: code, word: origTopEntry.cand.text, now: now)
+            if lead < Self.top1SwapInertia && origUserScore >= 0 {
+                sortedVisible.removeAll { $0.originalPos == 0 }
+                sortedVisible.insert(origTopEntry, at: 0)
+            }
+        }
+
+        let visible = sortedVisible.map(\.cand)
 
         // Keep blacklisted items only if everything else would disappear (safety fallback)
         let finalRerankable = visible.isEmpty ? rerankable : visible

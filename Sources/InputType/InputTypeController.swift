@@ -24,6 +24,8 @@ final class InputTypeController: IMKInputController {
     private var currentDirectCommitTexts: Set<String> = []
     private var asciiComposingBuffer: String? = nil
     private var isVModeActive = false
+    private var isPreeditAllSelected = false
+    private var isNavigatingCandidates = false
     private let queryCoordinator = QueryCoordinator(debounceMs: 45, timeoutMs: 200)
     private let candidatePresenter = CandidatePresenter(lockFirstWindowSeconds: 0.15, top1LeadThreshold: 0.15)
 
@@ -69,6 +71,8 @@ final class InputTypeController: IMKInputController {
             currentPresentedCandidates = []
             currentDirectCommitTexts = []
             asciiComposingBuffer = nil
+            isPreeditAllSelected = false
+            isNavigatingCandidates = false
         }
     }
 
@@ -88,6 +92,8 @@ final class InputTypeController: IMKInputController {
             currentPresentedCandidates = []
             currentDirectCommitTexts = []
             asciiComposingBuffer = nil
+            isPreeditAllSelected = false
+            isNavigatingCandidates = false
         }
         let client = sender as? (any IMKTextInput)
         registerActiveClient(client)
@@ -558,8 +564,19 @@ final class InputTypeController: IMKInputController {
             return true
         }
 
+        // Cmd + A while composing selects the entire composing pinyin so Backspace/Delete removes only the preedit
+        let allMods = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        if allMods == [.command] && event.keyCode == 0x00 && !currentPreedit.isEmpty && !isVModeActive && asciiComposingBuffer == nil {
+            isPreeditAllSelected = true
+            isNavigatingCandidates = false
+            selectAllMarkedPreedit(client: client)
+            return true
+        }
+
         // Pass through Command shortcuts directly to the app and reset context tracking
         if event.modifierFlags.contains(.command) {
+            isPreeditAllSelected = false
+            isNavigatingCandidates = false
             if isVModeActive {
                 exitVMode(client: client, clearMarked: true)
             }
@@ -568,6 +585,30 @@ final class InputTypeController: IMKInputController {
             }
             resetInputContextTracking()
             return false
+        }
+
+        // When the composing pinyin was selected via Cmd + A:
+        // - Backspace / Delete / Escape clears only the composing pinyin
+        // - Typing a new printable character replaces the old composing pinyin
+        if isPreeditAllSelected {
+            isPreeditAllSelected = false
+            if event.keyCode == 0x33 || event.keyCode == 0x75 || event.keyCode == 0x35 {
+                clearActiveRimeComposition(client: client)
+                return true
+            }
+            let nonShift = event.modifierFlags.intersection([.control, .option, .command])
+            if nonShift.isEmpty,
+               let chars = event.characters,
+               let scalar = chars.unicodeScalars.first,
+               scalar.value >= 0x21 && scalar.value <= 0x7e {
+                RimeEngine.shared.clearComposition(sessionId: sessionId)
+                currentPreedit = ""
+                currentCandidates = []
+                currentRimeCandidates = []
+                currentPresentedCandidates = []
+                currentDirectCommitTexts = []
+                isNavigatingCandidates = false
+            }
         }
 
         // V-Mode quick action menu / calculator / phrases / symbols / datetime
@@ -605,6 +646,7 @@ final class InputTypeController: IMKInputController {
         let modifiers = KeyCodeMapper.rimeModifiers(from: event.modifierFlags)
 
         let wasComposingBeforeKey = !currentPreedit.isEmpty
+        isNavigatingCandidates = false
         let rimeStart = CFAbsoluteTimeGetCurrent()
         let handled = RimeEngine.shared.processKey(sessionId: sessionId, keyCode: keyCode, mask: modifiers)
         let rimeProcessMs = (CFAbsoluteTimeGetCurrent() - rimeStart) * 1000.0
@@ -1834,11 +1876,33 @@ final class InputTypeController: IMKInputController {
             }
             return nil
 
-        case 0x7b: // Left Arrow
-            candidatesWin.moveLeft(self)
+        case 0x7b: // Left Arrow -> jump left by syllable boundary in preedit (or move left in candidates if navigating them)
+            if isCandidatesExpanded(candidatesWin) {
+                candidatesWin.moveLeft(self)
+                return true
+            }
+            if isNavigatingCandidates {
+                let firstItem = visibleFirstLineCandidates(candidatesWin).first
+                let currentItem = currentlyHighlightedCandidateText(candidatesWin)
+                if let firstItem, let currentItem, currentItem != firstItem {
+                    candidatesWin.moveLeft(self)
+                    return true
+                }
+                isNavigatingCandidates = false
+            }
+            movePreeditCaretLeftBySyllable(client: client)
             return true
 
-        case 0x7c: // Right Arrow
+        case 0x7c: // Right Arrow -> move right by 1 letter in preedit; once at end, move right into candidate selection
+            if isCandidatesExpanded(candidatesWin) {
+                candidatesWin.moveRight(self)
+                return true
+            }
+            if movePreeditCaretRightByCharIfPossible(client: client) {
+                isNavigatingCandidates = false
+                return true
+            }
+            isNavigatingCandidates = true
             candidatesWin.moveRight(self)
             return true
 
@@ -2499,6 +2563,97 @@ final class InputTypeController: IMKInputController {
         return false
     }
 
+    private func clearActiveRimeComposition(client: (any IMKTextInput)?) {
+        queryCoordinator.cancelAll()
+        candidatePresenter.reset()
+        RimeEngine.shared.clearComposition(sessionId: sessionId)
+        currentPreedit = ""
+        currentCandidates = []
+        currentRimeCandidates = []
+        currentPresentedCandidates = []
+        currentDirectCommitTexts = []
+        isPreeditAllSelected = false
+        isNavigatingCandidates = false
+        clearMarkedText(client: client)
+        hideCandidatesImmediately()
+    }
+
+    private func selectAllMarkedPreedit(client: (any IMKTextInput)?) {
+        guard !currentPreedit.isEmpty else { return }
+        let totalUTF16 = currentPreedit.utf16.count
+        let attrStr = NSMutableAttributedString(string: currentPreedit)
+        let fullRange = NSRange(location: 0, length: totalUTF16)
+        if let attrs = mark(forStyle: Int(kTSMHiliteSelectedRawText), at: fullRange) as? [NSAttributedString.Key: Any] {
+            attrStr.setAttributes(attrs, range: fullRange)
+        }
+        client?.setMarkedText(
+            attrStr,
+            selectionRange: fullRange,
+            replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
+        )
+    }
+
+    private func movePreeditCaretLeftBySyllable(client: (any IMKTextInput)?) {
+        guard let rawInput = RimeEngine.shared.getRawInput(sessionId: sessionId), !rawInput.isEmpty else { return }
+        let rawCaret = RimeEngine.shared.getCaretPos(sessionId: sessionId)
+        guard rawCaret > 0 else { return }
+
+        let targetPos = Self.previousSyllableBoundary(
+            rawInput: rawInput,
+            preedit: currentPreedit,
+            currentCaret: rawCaret
+        )
+        if targetPos != rawCaret {
+            RimeEngine.shared.setCaretPos(sessionId: sessionId, pos: targetPos)
+            syncRimeState(client: client)
+        }
+    }
+
+    private func movePreeditCaretRightByCharIfPossible(client: (any IMKTextInput)?) -> Bool {
+        guard let rawInput = RimeEngine.shared.getRawInput(sessionId: sessionId), !rawInput.isEmpty else {
+            return false
+        }
+        let rawLen = rawInput.utf8.count
+        let rawCaret = RimeEngine.shared.getCaretPos(sessionId: sessionId)
+        guard rawCaret < rawLen else {
+            return false
+        }
+        RimeEngine.shared.setCaretPos(sessionId: sessionId, pos: rawCaret + 1)
+        syncRimeState(client: client)
+        return true
+    }
+
+    /// Computes the nearest syllable/segment boundary strictly before `currentCaret` in Rime's raw input buffer.
+    static func previousSyllableBoundary(rawInput: String, preedit: String, currentCaret: Int) -> Int {
+        guard currentCaret > 0 else { return 0 }
+        let rawLen = rawInput.utf8.count
+        let clampedCaret = min(currentCaret, rawLen)
+
+        let asciiTailStart = preedit.lastIndex(where: { !$0.isASCII })
+            .map { preedit.index(after: $0) } ?? preedit.startIndex
+        let asciiTail = String(preedit[asciiTailStart...])
+        let segments = asciiTail.split { $0 == " " || $0 == "'" || $0 == "·" }
+        let tailRawLen = segments.reduce(0) { $0 + $1.utf8.count }
+        let baseOffset = max(0, rawLen - tailRawLen)
+
+        var boundaries: [Int] = [0]
+        if baseOffset > 0 {
+            boundaries.append(baseOffset)
+        }
+        var cursor = baseOffset
+        for seg in segments {
+            cursor += seg.utf8.count
+            if cursor <= rawLen {
+                boundaries.append(cursor)
+            }
+        }
+
+        if let prev = boundaries.last(where: { $0 < clampedCaret }) {
+            return prev
+        }
+        return max(0, clampedCaret - 1)
+    }
+
     private func syncRimeState(
         client: (any IMKTextInput)?,
         keystrokeStartAt: CFAbsoluteTime? = nil,
@@ -2523,6 +2678,8 @@ final class InputTypeController: IMKInputController {
             currentRimeCandidates = []
             currentPresentedCandidates = []
             currentDirectCommitTexts = []
+            isPreeditAllSelected = false
+            isNavigatingCandidates = false
             candidatePresenter.reset()
             queryCoordinator.cancelAll()
             // insertText already replaces marked text and exits composition mode;
@@ -2542,6 +2699,8 @@ final class InputTypeController: IMKInputController {
             currentRimeCandidates = []
             currentPresentedCandidates = []
             currentDirectCommitTexts = []
+            isPreeditAllSelected = false
+            isNavigatingCandidates = false
             candidatePresenter.reset()
             queryCoordinator.cancelAll()
             if hadPreedit && !didCommit {
