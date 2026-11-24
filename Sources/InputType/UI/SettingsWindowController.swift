@@ -1807,7 +1807,11 @@ private struct SidebarIconView: View {
 }
 
 private struct SettingsRootView: View {
-    @State private var selectedSection: SettingsSection? = .input
+    @State private var selectedSection: SettingsSection?
+
+    init(initialSection: SettingsSection = .input) {
+        _selectedSection = State(initialValue: initialSection)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -4148,8 +4152,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private(set) var isOpen = false
 
     private init() {
+        super.init(window: nil)
+    }
+
+    private func buildWindow(initialSection: SettingsSection) -> NSWindow {
         Self.ensureStandardEditMenu()
-        let hostingController = NSHostingController(rootView: SettingsRootView())
+        let hostingController = NSHostingController(rootView: SettingsRootView(initialSection: initialSection))
         let window = SettingsWindow(contentViewController: hostingController)
         window.title = "Prime 输入法设置"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
@@ -4159,8 +4167,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.center()
-        super.init(window: window)
         window.delegate = self
+        self.window = window
+        return window
     }
 
     private static func ensureStandardEditMenu() {
@@ -4195,28 +4204,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func show() {
-        guard let window else { return }
+        show(initialSection: .input)
+    }
+
+    private func show(initialSection: SettingsSection) {
+        let targetWindow = window ?? buildWindow(initialSection: initialSection)
         Self.ensureStandardEditMenu()
         if !isOpen {
             isOpen = true
             NSApp.setActivationPolicy(.regular)
-            window.center()
+            targetWindow.center()
         }
-        if window.isMiniaturized {
-            window.deminiaturize(nil)
+        if targetWindow.isMiniaturized {
+            targetWindow.deminiaturize(nil)
         }
-        window.makeKeyAndOrderFront(nil)
+        targetWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        lockSidebarWidth(in: window, width: 185)
-        DispatchQueue.main.async { [weak self, weak window] in
-            guard let self, let window else { return }
-            self.lockSidebarWidth(in: window, width: 185)
+        lockSidebarWidth(in: targetWindow, width: 185)
+        DispatchQueue.main.async { [weak self, weak targetWindow] in
+            guard let self, let targetWindow else { return }
+            self.lockSidebarWidth(in: targetWindow, width: 185)
         }
     }
 
     func showAbout() {
-        NotificationCenter.default.post(name: .primeTypeSelectAboutSection, object: nil)
-        show()
+        if window != nil {
+            NotificationCenter.default.post(name: .primeTypeSelectAboutSection, object: nil)
+            show(initialSection: .about)
+        } else {
+            show(initialSection: .about)
+        }
     }
 
     private func lockSidebarWidth(in window: NSWindow, width: CGFloat) {
@@ -4239,7 +4256,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        let closingWindow = notification.object as? NSWindow
         isOpen = false
         NSApp.setActivationPolicy(.accessory)
+        // Release the SwiftUI view hierarchy and backing layers once the window finishes closing
+        // so Settings does not keep ~15-20 MB resident in the background IME process.
+        DispatchQueue.main.async { [weak self, weak closingWindow] in
+            guard let self, !self.isOpen else { return }
+            if let win = closingWindow ?? self.window {
+                win.delegate = nil
+                win.contentViewController = nil
+                if self.window === win {
+                    self.window = nil
+                }
+            }
+        }
     }
 }

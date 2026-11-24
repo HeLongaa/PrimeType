@@ -28,9 +28,9 @@
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.7</string>
+    <string>1.0.8</string>
     <key>CFBundleVersion</key>
-    <string>107</string>
+    <string>108</string>
     <key>InputMethodConnectionName</key>
     <string>com.lumocore.inputmethod.PrimeType_Connection</string>
     <key>InputMethodServerControllerClass</key>

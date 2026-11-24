@@ -50,15 +50,13 @@ final class InputTypeController: IMKInputController {
     }
 
     deinit {
-        if sessionId != 0 && engineGeneration == RimeEngine.shared.generation {
-            RimeEngine.shared.destroySession(sessionId)
-        }
+        // Shared Rime session is owned by RimeEngine; do not destroy it when a background controller deallocates.
     }
 
     private func ensureValidSession() {
         let gen = RimeEngine.shared.generation
         if sessionId == 0 || engineGeneration != gen {
-            sessionId = RimeEngine.shared.createSession()
+            sessionId = RimeEngine.shared.sharedSession()
             engineGeneration = gen
             currentPreedit = ""
             currentCandidates = []
@@ -70,7 +68,18 @@ final class InputTypeController: IMKInputController {
 
     override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
+        let switchingController = Self.latestActiveController !== self
         ensureValidSession()
+        if switchingController {
+            if sessionId != 0 {
+                RimeEngine.shared.clearComposition(sessionId: sessionId)
+            }
+            currentPreedit = ""
+            currentCandidates = []
+            currentRimeCandidates = []
+            currentDirectCommitTexts = []
+            asciiComposingBuffer = nil
+        }
         let client = sender as? (any IMKTextInput)
         registerActiveClient(client)
         resetInputContextTracking()
@@ -93,7 +102,8 @@ final class InputTypeController: IMKInputController {
     }
 
     override func deactivateServer(_ sender: Any!) {
-        if Self.latestActiveController === self {
+        let wasActiveController = Self.latestActiveController === self
+        if wasActiveController {
             let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
             if frontBundle != Bundle.main.bundleIdentifier {
                 Self.isServerCurrentlyActive = false
@@ -102,9 +112,13 @@ final class InputTypeController: IMKInputController {
         if isVModeActive {
             exitVMode(client: sender as? (any IMKTextInput) ?? currentClient, clearMarked: true)
         }
-        commitComposition(sender)
+        if wasActiveController || !currentPreedit.isEmpty || asciiComposingBuffer != nil {
+            commitComposition(sender)
+        }
         resetInputContextTracking()
-        hideCandidatesImmediately()
+        if wasActiveController {
+            hideCandidatesImmediately()
+        }
         super.deactivateServer(sender)
     }
 
@@ -420,11 +434,18 @@ final class InputTypeController: IMKInputController {
         }
         guard sessionId != 0 else { return }
         let hadPreedit = !currentPreedit.isEmpty
+        guard hadPreedit || Self.latestActiveController === self else {
+            currentCandidates = []
+            currentRimeCandidates = []
+            currentDirectCommitTexts = []
+            return
+        }
         if RimeEngine.shared.commitComposition(sessionId: sessionId) {
             if let commitText = RimeEngine.shared.getCommitText(sessionId: sessionId), !commitText.isEmpty {
                 insertProcessedText(commitText, client: targetClient, allowAutoPair: false)
             }
         }
+        RimeEngine.shared.clearComposition(sessionId: sessionId)
         currentPreedit = ""
         currentCandidates = []
         currentRimeCandidates = []

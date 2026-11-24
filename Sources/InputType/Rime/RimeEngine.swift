@@ -25,6 +25,7 @@ final class RimeEngine {
     private var api: UnsafeMutablePointer<RimeApi>?
     private var isStarted = false
     private var didSetupRime = false
+    private var sharedSessionId: RimeSessionId = 0
 
     private let baseUserDir: String
     let logDir: String
@@ -181,6 +182,7 @@ final class RimeEngine {
             }
         }
 
+        sharedSessionId = 0
         generation &+= 1
         isStarted = true
     }
@@ -201,6 +203,10 @@ final class RimeEngine {
         lock.lock()
         defer { lock.unlock() }
         guard isStarted, let api else { return }
+        if sharedSessionId != 0 {
+            _ = api.pointee.destroy_session(sharedSessionId)
+            sharedSessionId = 0
+        }
         api.pointee.finalize()
         generation &+= 1
         isStarted = false
@@ -210,6 +216,10 @@ final class RimeEngine {
         lock.lock()
         defer { lock.unlock() }
         guard let api else { return }
+        if sharedSessionId != 0 {
+            _ = api.pointee.destroy_session(sharedSessionId)
+            sharedSessionId = 0
+        }
         api.pointee.finalize()
         initializeRimeLocked(
             preset: currentPreset,
@@ -223,6 +233,10 @@ final class RimeEngine {
         defer { lock.unlock() }
         let targetPreset = isPresetAvailable(preset) ? preset : .rimeIce
         if isStarted, let api {
+            if sharedSessionId != 0 {
+                _ = api.pointee.destroy_session(sharedSessionId)
+                sharedSessionId = 0
+            }
             api.pointee.finalize()
             isStarted = false
         }
@@ -233,6 +247,26 @@ final class RimeEngine {
             forceMaintenance: !hasExistingBuild,
             waitForMaintenance: waitForMaintenance
         )
+    }
+
+    /// Returns a single process-wide Rime session reused across all IMKInputController instances.
+    /// Avoids multiplying ConcreteEngine / Lua VM / OpenCC / UserDictionary allocations per client window.
+    func sharedSession() -> RimeSessionId {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let api, isStarted else { return 0 }
+        if sharedSessionId != 0 {
+            return sharedSessionId
+        }
+        let sid = api.pointee.create_session()
+        if sid != 0 {
+            let schemaID = currentPreset.schemaID
+            schemaID.withCString { cStr in
+                _ = api.pointee.select_schema(sid, cStr)
+            }
+            sharedSessionId = sid
+        }
+        return sid
     }
 
     func createSession() -> RimeSessionId {

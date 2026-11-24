@@ -86,11 +86,23 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 
     func close() {
         window?.close()
+        window?.delegate = nil
+        window?.contentViewController = nil
         window = nil
     }
 
     func windowWillClose(_ notification: Notification) {
-        window = nil
+        let closingWindow = notification.object as? NSWindow
+        DispatchQueue.main.async { [weak self, weak closingWindow] in
+            guard let self else { return }
+            if let win = closingWindow ?? self.window {
+                win.delegate = nil
+                win.contentViewController = nil
+                if self.window === win {
+                    self.window = nil
+                }
+            }
+        }
     }
 }
 
