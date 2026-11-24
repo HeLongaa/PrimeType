@@ -3,6 +3,7 @@ import Carbon
 import AVFoundation
 import AudioToolbox
 import CoreAudio
+import CoreMedia
 import os
 
 enum VoiceSystemSoundPlayer {
@@ -650,18 +651,238 @@ private final class SmartChannelDownmixer {
     }
 }
 
-/// Low-latency CoreAudio HAL input recorder.
-/// - Opens the target AudioDeviceID directly at its native hardware sample rate (bypassing default Bluetooth handoff)
-/// - Dispatches off CoreAudio's RT thread via HAL's serial dispatch queue + `OSAllocatedUnfairLock`
-/// - Uses adaptive multi-channel downmix + Apple `AudioConverterFillComplexBuffer` high-quality anti-aliasing resampling
-/// - Handles USB hot-unplug/replug, system default device changes, external sample-rate changes, and Mac sleep/wake.
-private final class VoiceAudioRecorder {
+// MARK: - Layer 3: Non-Zero PCM Activation Detector
+
+/// Distinguishes `AVCaptureSession.startRunning()` returning from real audio arriving from the hardware/Bluetooth ADC.
+/// Tracks leading all-zero DMA frames and confirms real activation on the first non-zero sample (or 300ms fallback timeout).
+struct VoiceActivationTracker {
+    enum Phase: Equatable {
+        case waiting
+        case allZeroStarted
+        case confirmedNonZero
+        case confirmedTimeout
+    }
+
+    struct StepOutcome: Equatable {
+        let isActivated: Bool
+        let justConfirmed: Bool
+        let shouldDropFrame: Bool
+        let eventLog: String?
+    }
+
+    static let maxZeroWarmupFrames = 15 // 15 * 20ms = 300ms timeout fallback for muted/silent mics
+
+    private(set) var phase: Phase = .waiting
+    private(set) var zeroFrameCount: Int = 0
+    private(set) var captureGeneration: Int = 0
+    private(set) var captureStartedAt: CFAbsoluteTime = 0
+    private(set) var confirmedWakeupMs: Double?
+
+    var isActivated: Bool {
+        phase == .confirmedNonZero || phase == .confirmedTimeout
+    }
+
+    mutating func reset(captureGeneration: Int, startedAt: CFAbsoluteTime) {
+        self.phase = .waiting
+        self.zeroFrameCount = 0
+        self.captureGeneration = captureGeneration
+        self.captureStartedAt = startedAt
+        self.confirmedWakeupMs = nil
+    }
+
+    mutating func markAlreadyActive(captureGeneration: Int) {
+        self.captureGeneration = captureGeneration
+        self.phase = .confirmedNonZero
+        self.confirmedWakeupMs = 0
+    }
+
+    mutating func consume(frame: [Int16], now: CFAbsoluteTime) -> StepOutcome {
+        if isActivated {
+            return StepOutcome(isActivated: true, justConfirmed: false, shouldDropFrame: false, eventLog: nil)
+        }
+
+        let elapsedMs = max(0.0, (now - captureStartedAt) * 1000.0)
+        let hasNonZero = frame.contains { $0 != 0 }
+
+        if hasNonZero {
+            phase = .confirmedNonZero
+            confirmedWakeupMs = elapsedMs
+            let log = String(
+                format: "[AVCaptureSessionAudioRecorder] first_nonzero_pcm capture=%d zeroFrames=%d elapsedMs=%.1f | activation_nonzero_pcm_confirmed",
+                captureGeneration,
+                zeroFrameCount,
+                elapsedMs
+            )
+            return StepOutcome(isActivated: true, justConfirmed: true, shouldDropFrame: false, eventLog: log)
+        }
+
+        zeroFrameCount += 1
+        if zeroFrameCount >= Self.maxZeroWarmupFrames {
+            phase = .confirmedTimeout
+            confirmedWakeupMs = elapsedMs
+            let log = String(
+                format: "[AVCaptureSessionAudioRecorder] nonzero_pcm_timeout capture=%d zeroFrames=%d elapsedMs=%.1f",
+                captureGeneration,
+                zeroFrameCount,
+                elapsedMs
+            )
+            return StepOutcome(isActivated: true, justConfirmed: true, shouldDropFrame: false, eventLog: log)
+        }
+
+        if phase == .waiting {
+            phase = .allZeroStarted
+            let log = String(
+                format: "[AVCaptureSessionAudioRecorder] all_zero_pcm_started capture=%d elapsedMs=%.1f",
+                captureGeneration,
+                elapsedMs
+            )
+            return StepOutcome(isActivated: false, justConfirmed: false, shouldDropFrame: true, eventLog: log)
+        }
+
+        return StepOutcome(isActivated: false, justConfirmed: false, shouldDropFrame: true, eventLog: nil)
+    }
+}
+
+// MARK: - Layer 4: 150ms Pre-Roll & Begin-Padding Buffer (2400 samples @ 16kHz)
+
+/// Preserves the leading 150ms (`begin_padding_ms = 150`, 2400 Int16 samples @ 16kHz) across both:
+/// 1. Warm standby / key-down pre-roll (rolling ring buffer flushed atomically at capture start), and
+/// 2. Cold capture start (accumulating the first 150ms before contiguous flush, with lossless flush on short stops).
+struct VoicePreRollBuffer {
+    static let sampleRate = 16_000
     static let frameSamples = 320 // 20ms @ 16kHz
-    static let defaultWarmStandbyDuration: TimeInterval = 8.0
+    static let beginPaddingMs = 150
+    static let beginPaddingSamples = 2400 // 150ms @ 16kHz
+    static let maxHoldPreRollSamples = 9600 // 600ms @ 16kHz while holding modifier key
+
+    private var rollingSamples: [Int16] = []
+    private var coldStartSamples: [Int16] = []
+    private var streamPending: [Int16] = []
+    private(set) var isColdStartPaddingPending = false
+
+    var rollingSampleCount: Int { rollingSamples.count }
+    var coldStartBufferedCount: Int { coldStartSamples.count }
+
+    mutating func resetAll() {
+        rollingSamples.removeAll(keepingCapacity: true)
+        coldStartSamples.removeAll(keepingCapacity: true)
+        streamPending.removeAll(keepingCapacity: true)
+        isColdStartPaddingPending = false
+    }
+
+    mutating func appendRolling(_ samples: [Int16], maxSamples: Int) {
+        guard !samples.isEmpty else { return }
+        rollingSamples.append(contentsOf: samples)
+        if rollingSamples.count > maxSamples {
+            rollingSamples.removeFirst(rollingSamples.count - maxSamples)
+        }
+    }
+
+    mutating func trimRolling(to maxSamples: Int) {
+        if rollingSamples.count > maxSamples {
+            rollingSamples.removeFirst(rollingSamples.count - maxSamples)
+        }
+    }
+
+    /// Transitions into active capture. Returns any non-zero pre-roll frames ready for immediate flush.
+    /// If no live pre-roll samples existed (cold start), arms the 150ms (2400-sample) begin-padding accumulator.
+    mutating func beginCapture(useRollingPreRoll: Bool) -> [[Int16]] {
+        coldStartSamples.removeAll(keepingCapacity: true)
+        streamPending.removeAll(keepingCapacity: true)
+
+        guard useRollingPreRoll, !rollingSamples.isEmpty else {
+            rollingSamples.removeAll(keepingCapacity: true)
+            isColdStartPaddingPending = true
+            return []
+        }
+
+        let trimmed: [Int16]
+        if let firstNonZero = rollingSamples.firstIndex(where: { $0 != 0 }) {
+            // Preserve up to 20ms (320 samples) of natural silence lead-in right before first non-zero sample
+            let startIdx = max(0, firstNonZero - Self.frameSamples)
+            trimmed = Array(rollingSamples[startIdx...])
+        } else {
+            trimmed = []
+        }
+        rollingSamples.removeAll(keepingCapacity: true)
+
+        guard !trimmed.isEmpty else {
+            isColdStartPaddingPending = true
+            return []
+        }
+
+        // We already have live pre-roll audio; stream directly with 0ms additional padding delay
+        isColdStartPaddingPending = false
+        streamPending.append(contentsOf: trimmed)
+        return popCompleteFrames(from: &streamPending)
+    }
+
+    /// Feeds post-activation 16kHz Int16 samples during `.capturing`, returning 20ms (320-sample) frames to push to ASR.
+    mutating func appendCaptureSamples(_ samples: [Int16]) -> [[Int16]] {
+        guard !samples.isEmpty else { return [] }
+
+        if isColdStartPaddingPending {
+            coldStartSamples.append(contentsOf: samples)
+            guard coldStartSamples.count >= Self.beginPaddingSamples else {
+                return []
+            }
+            isColdStartPaddingPending = false
+            streamPending.append(contentsOf: coldStartSamples)
+            coldStartSamples.removeAll(keepingCapacity: true)
+            return popCompleteFrames(from: &streamPending)
+        }
+
+        streamPending.append(contentsOf: samples)
+        return popCompleteFrames(from: &streamPending)
+    }
+
+    /// Flushes any buffered cold-start padding (<150ms short utterances) and trailing partial frame on capture stop.
+    mutating func flushOnStop() -> [[Int16]] {
+        if !coldStartSamples.isEmpty {
+            streamPending.append(contentsOf: coldStartSamples)
+            coldStartSamples.removeAll(keepingCapacity: true)
+        }
+        isColdStartPaddingPending = false
+
+        var frames = popCompleteFrames(from: &streamPending)
+        if !streamPending.isEmpty {
+            let padded = streamPending + [Int16](repeating: 0, count: max(0, Self.frameSamples - streamPending.count))
+            frames.append(padded)
+            streamPending.removeAll(keepingCapacity: true)
+        }
+        return frames
+    }
+
+    private func popCompleteFrames(from buffer: inout [Int16]) -> [[Int16]] {
+        var out: [[Int16]] = []
+        let count = buffer.count / Self.frameSamples
+        guard count > 0 else { return out }
+        out.reserveCapacity(count)
+        var offset = 0
+        for _ in 0..<count {
+            out.append(Array(buffer[offset..<(offset + Self.frameSamples)]))
+            offset += Self.frameSamples
+        }
+        buffer.removeFirst(offset)
+        return out
+    }
+}
+
+/// Four-layer low-latency `AVCaptureSession` voice recorder modeled after WeType's fast-wakeup architecture:
+/// 1. **VoiceAudioFrameworkPrewarmer**: Pre-enumerates audio devices (incl. Bluetooth) and builds/configures
+///    the `AVCaptureSession` + `AVCaptureDeviceInput` + `AVCaptureAudioDataOutput` (16kHz/Mono/Int16) graph
+///    on a background queue with `captureStarted = false` (no orange mic dot while idle).
+/// 2. **Capture Graph Reuse**: Keeps the configured session resident across presses; keypress only calls
+///    `session.startRunning()` (~10–30ms). Keeps running in `.warmStandby` for 30s for 0ms repeat wakeup,
+///    then calls `stopRunning()` while retaining the configured graph for fast re-start.
+/// 3. **Non-Zero PCM Activation Detection**: Separates `startRunning()` from real audio arrival via
+///    `VoiceActivationTracker` (`all_zero_pcm_started` -> `first_nonzero_pcm` / `nonzero_pcm_timeout`).
+/// 4. **150ms Pre-Roll / Begin Padding**: Preserves leading 150ms (`2400` Int16 samples @ 16kHz) via
+///    `VoicePreRollBuffer` so the first syllable spoken at keypress is never clipped.
+private final class VoiceAudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    static let frameSamples = VoicePreRollBuffer.frameSamples // 320 (20ms @ 16kHz)
+    static let defaultWarmStandbyDuration: TimeInterval = 30.0 // 30s reuse window before stopRunning()
     private static let leadingSilenceFrameCount = 6 // 120ms leading silence for cloud ASR VAD stability
-    private static let maxPreRollFrames = 30 // up to 600ms during keypress pre-roll
-    private static let maxStandbyFrames = 12 // keep last 240ms rolling during warm standby / always-on
-    private static let maxZeroWarmupFrames = 15 // fallback 300ms if mic is hardware-muted / ultra-quiet
 
     private enum Mode {
         case idle
@@ -676,51 +897,53 @@ private final class VoiceAudioRecorder {
         var startedForPreRoll = false
         var isSystemSleeping = false
         var desiredMicUID: String = ""
-        var pending: [Int16] = []
-        var preRollFrames: [[Int16]] = []
+        var activation = VoiceActivationTracker()
+        var preRoll = VoicePreRollBuffer()
+        var rawFrameAccumulator: [Int16] = []
         var liveSessions: [any VoiceASRSession] = []
-        var hasSeenLiveAudio = false
-        var warmupFrameCount = 0
         var standbyToken: Int = 0
         var captureGeneration: Int = 0
     }
 
-    private let audioCallbackQueue = DispatchQueue(label: "com.lumocore.inputtype.voice.hal.callback", qos: .userInteractive)
-    private let controlQueue = DispatchQueue(label: "com.lumocore.inputtype.voice.hal.control", qos: .userInteractive)
+    private let sampleBufferQueue = DispatchQueue(label: "com.lumocore.inputtype.voice.capture.sample", qos: .userInteractive)
+    private let controlQueue = DispatchQueue(label: "com.lumocore.inputtype.voice.capture.control", qos: .userInteractive)
     private let state = OSAllocatedUnfairLock(initialState: SharedState())
 
     // Owned exclusively by controlQueue
-    private var activeDeviceID: AudioDeviceID = kAudioObjectUnknown
-    private var activeIOProcID: AudioDeviceIOProcID?
-    private var activeMicUID: String?
+    private var captureSession: AVCaptureSession?
+    private var captureInput: AVCaptureDeviceInput?
+    private var captureOutput: AVCaptureAudioDataOutput?
+    private var preparedDeviceUID: String?
+    private var preparedDesiredMicUID: String?
     private var standbyTimer: DispatchWorkItem?
     private var wakeRestoreWorkItem: DispatchWorkItem?
+    private var topologyDebounceWorkItem: DispatchWorkItem?
 
-    // Per-device CoreAudio listeners (registered/removed on controlQueue)
-    private var aliveListenerBlock: AudioObjectPropertyListenerBlock?
-    private var sampleRateListenerBlock: AudioObjectPropertyListenerBlock?
-    private var streamFormatListenerBlock: AudioObjectPropertyListenerBlock?
-
-    // System-wide CoreAudio & Sleep/Wake listeners
+    // System-wide CoreAudio, AVFoundation & Sleep/Wake listeners
     private var devicesListListenerBlock: AudioObjectPropertyListenerBlock?
     private var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
+    private var deviceConnectedObserver: NSObjectProtocol?
+    private var deviceDisconnectedObserver: NSObjectProtocol?
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
-    // Owned exclusively by audioCallbackQueue (reconfigured via audioCallbackQueue.sync before starting/updating)
-    private var activeStreamFormat = AudioStreamBasicDescription()
-    private var downmixer = SmartChannelDownmixer()
-    private var resampler = MemoryAudioConverterResampler(sourceSampleRate: 48000.0)
-    private var monoScratch: [Float] = []
-    private var resampledScratch: [Int16] = []
+    // Owned exclusively by sampleBufferQueue (fallback conversion if hardware ignores 16kHz Int16 audioSettings)
+    private var fallbackDownmixer = SmartChannelDownmixer()
+    private var fallbackResampler: MemoryAudioConverterResampler?
+    private var fallbackSourceRate: Double = 0
+    private var fallbackMonoScratch: [Float] = []
+    private var fallbackResampledScratch: [Int16] = []
+    private var fastInt16Scratch: [Int16] = []
 
     var onLevel: ((Float) -> Void)?
     var onMicReady: ((Int) -> Void)?
     var onStartError: ((Int, Error) -> Void)?
 
-    init() {
-        monoScratch.reserveCapacity(2048)
-        resampledScratch.reserveCapacity(1024)
+    override init() {
+        super.init()
+        fallbackMonoScratch.reserveCapacity(2048)
+        fallbackResampledScratch.reserveCapacity(1024)
+        fastInt16Scratch.reserveCapacity(1024)
         installSystemListeners()
     }
 
@@ -728,12 +951,43 @@ private final class VoiceAudioRecorder {
         removeSystemListeners()
     }
 
-    /// Configures optional always-on low-power standby (0ms instant start) or switches standby device.
+    // MARK: - Layer 1: Passive Graph Prewarming (captureStarted = false)
+
+    /// Pre-enumerates audio devices and builds the `AVCaptureSession` capture graph on a background queue
+    /// WITHOUT starting capture (`captureStarted = false`), so no mic privacy indicator appears while idle.
+    func prewarm(microphoneUID: String, trigger: String) {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            NSLog("[VoicePrewarm] skip reason=not_authorized trigger=%@", trigger)
+            return
+        }
+
+        let shouldProceed: Bool = state.withLock { s in
+            guard !s.isSystemSleeping else { return false }
+            if s.mode == .idle {
+                s.desiredMicUID = microphoneUID
+            }
+            return s.mode == .idle
+        }
+        guard shouldProceed else { return }
+
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            let stillIdle = self.state.withLock { $0.mode == .idle && !$0.isSystemSleeping }
+            guard stillIdle else {
+                NSLog("[VoicePrewarm] cancelled stage=before_query trigger=%@", trigger)
+                return
+            }
+            _ = self.prepareCaptureGraphOnControlQueue(microphoneUID: microphoneUID, trigger: trigger)
+        }
+    }
+
+    /// Configures optional always-on low-power standby (0ms instant start) or switches standby/prewarmed device.
     func setAlwaysOn(_ enabled: Bool, microphoneUID: String) {
         enum Action {
             case none
             case startOrSwitchWarm
-            case stopStandby
+            case stopStandbyKeepGraph
+            case prewarmIdleGraph
         }
 
         let action: Action = state.withLock { s in
@@ -750,18 +1004,16 @@ private final class VoiceAudioRecorder {
                 case .idle:
                     s.mode = .warmStandby
                     s.desiredMicUID = microphoneUID
-                    s.pending.removeAll(keepingCapacity: true)
-                    s.preRollFrames.removeAll(keepingCapacity: true)
-                    s.hasSeenLiveAudio = false
-                    s.warmupFrameCount = 0
+                    s.preRoll.resetAll()
+                    s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                    s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                     return .startOrSwitchWarm
                 case .warmStandby:
                     if deviceChanged {
                         s.desiredMicUID = microphoneUID
-                        s.pending.removeAll(keepingCapacity: true)
-                        s.preRollFrames.removeAll(keepingCapacity: true)
-                        s.hasSeenLiveAudio = false
-                        s.warmupFrameCount = 0
+                        s.preRoll.resetAll()
+                        s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                        s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                     }
                     return .startOrSwitchWarm
                 case .preRolling, .capturing:
@@ -772,15 +1024,15 @@ private final class VoiceAudioRecorder {
                 case .warmStandby:
                     s.standbyToken &+= 1
                     s.mode = .idle
-                    s.pending.removeAll(keepingCapacity: true)
-                    s.preRollFrames.removeAll(keepingCapacity: true)
-                    s.hasSeenLiveAudio = false
-                    s.warmupFrameCount = 0
-                    return .stopStandby
-                case .idle, .preRolling, .capturing:
-                    if deviceChanged && s.mode == .idle {
-                        s.desiredMicUID = microphoneUID
-                    }
+                    s.desiredMicUID = microphoneUID
+                    s.preRoll.resetAll()
+                    s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                    s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
+                    return .stopStandbyKeepGraph
+                case .idle:
+                    s.desiredMicUID = microphoneUID
+                    return .prewarmIdleGraph
+                case .preRolling, .capturing:
                     return .none
                 }
             }
@@ -796,23 +1048,31 @@ private final class VoiceAudioRecorder {
                 self.standbyTimer = nil
                 let shouldRun = self.state.withLock { $0.mode != .idle && !$0.isSystemSleeping }
                 if shouldRun {
-                    _ = self.ensureHALRunningOnControlQueue(microphoneUID: microphoneUID)
+                    _ = self.ensureCaptureRunningOnControlQueue(microphoneUID: microphoneUID, trigger: "always_on")
                 }
             }
-        case .stopStandby:
+        case .stopStandbyKeepGraph:
             controlQueue.async { [weak self] in
                 guard let self else { return }
                 self.standbyTimer?.cancel()
                 self.standbyTimer = nil
                 let stillIdle = self.state.withLock { $0.mode == .idle }
                 if stillIdle {
-                    self.stopAndDisposeOnControlQueue()
+                    self.stopRunningKeepingGraphOnControlQueue()
+                    if self.preparedDesiredMicUID != microphoneUID,
+                       AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+                        _ = self.prepareCaptureGraphOnControlQueue(microphoneUID: microphoneUID, trigger: "device_switch_idle")
+                    }
                 }
             }
+        case .prewarmIdleGraph:
+            prewarm(microphoneUID: microphoneUID, trigger: "preference_sync")
         }
     }
 
-    /// Begins warming up the microphone immediately on key-down and buffering frames into memory.
+    // MARK: - Layer 2: Fast Capture Start & Graph Reuse
+
+    /// Begins warming up & rolling-buffering the microphone immediately on modifier key-down.
     func startPreRoll(microphoneUID: String) {
         let shouldStartDevice: Bool? = state.withLock { s in
             guard !s.isSystemSleeping else { return nil }
@@ -824,9 +1084,9 @@ private final class VoiceAudioRecorder {
                     return nil
                 }
                 s.desiredMicUID = microphoneUID
-                s.preRollFrames.removeAll(keepingCapacity: true)
-                s.hasSeenLiveAudio = false
-                s.warmupFrameCount = 0
+                s.preRoll.resetAll()
+                s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                 return true
             case .warmStandby:
                 s.standbyToken &+= 1
@@ -834,9 +1094,9 @@ private final class VoiceAudioRecorder {
                 s.startedForPreRoll = false
                 if s.desiredMicUID != microphoneUID {
                     s.desiredMicUID = microphoneUID
-                    s.preRollFrames.removeAll(keepingCapacity: true)
-                    s.hasSeenLiveAudio = false
-                    s.warmupFrameCount = 0
+                    s.preRoll.resetAll()
+                    s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                    s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                     return true
                 }
                 return false
@@ -845,10 +1105,9 @@ private final class VoiceAudioRecorder {
                 s.mode = .preRolling
                 s.startedForPreRoll = true
                 s.desiredMicUID = microphoneUID
-                s.pending.removeAll(keepingCapacity: true)
-                s.preRollFrames.removeAll(keepingCapacity: true)
-                s.hasSeenLiveAudio = false
-                s.warmupFrameCount = 0
+                s.preRoll.resetAll()
+                s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                 return true
             }
         }
@@ -858,29 +1117,29 @@ private final class VoiceAudioRecorder {
             guard let self else { return }
             self.standbyTimer?.cancel()
             self.standbyTimer = nil
-            if shouldStartDevice || self.activeIOProcID == nil || self.activeMicUID != microphoneUID {
-                _ = self.ensureHALRunningOnControlQueue(microphoneUID: microphoneUID)
+            if shouldStartDevice || self.captureSession?.isRunning != true || self.preparedDesiredMicUID != microphoneUID {
+                _ = self.ensureCaptureRunningOnControlQueue(microphoneUID: microphoneUID, trigger: "key_down_preroll")
             }
         }
     }
 
     /// Cancels a pending key-down pre-roll (e.g. user pressed Right-Cmd + C).
+    /// Stops capture immediately if it wasn't previously in warm standby, while retaining the prewarmed graph.
     func cancelPreRoll(warmStandbyDuration: TimeInterval = defaultWarmStandbyDuration) {
         let decision: (action: Int, token: Int, keepForever: Bool) = state.withLock { s in
             guard s.mode == .preRolling else { return (0, 0, false) }
             if s.startedForPreRoll && !s.alwaysOnEnabled {
                 s.mode = .idle
                 s.startedForPreRoll = false
-                s.pending.removeAll(keepingCapacity: true)
-                s.preRollFrames.removeAll(keepingCapacity: true)
-                s.hasSeenLiveAudio = false
-                s.warmupFrameCount = 0
+                s.preRoll.resetAll()
+                s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                 return (1, s.standbyToken, false)
             } else {
                 s.standbyToken &+= 1
                 s.mode = .warmStandby
                 s.startedForPreRoll = false
-                Self.trimPreRoll(&s.preRollFrames, limit: Self.maxStandbyFrames)
+                s.preRoll.trimRolling(to: VoicePreRollBuffer.beginPaddingSamples)
                 return (2, s.standbyToken, s.alwaysOnEnabled)
             }
         }
@@ -890,22 +1149,23 @@ private final class VoiceAudioRecorder {
                 guard let self else { return }
                 let stillIdle = self.state.withLock { $0.mode == .idle }
                 if stillIdle {
-                    self.stopAndDisposeOnControlQueue()
+                    self.stopRunningKeepingGraphOnControlQueue()
                 }
             }
         } else if decision.action == 2 && !decision.keepForever {
-            scheduleStandbyDispose(token: decision.token, duration: warmStandbyDuration)
+            scheduleStandbyPause(token: decision.token, duration: warmStandbyDuration)
         }
     }
 
-    /// Transitions into active capture, atomically injecting leading silence + pre-roll frames before live streaming.
-    /// Returns whether the microphone is already producing live audio frames (true => 0ms warm start).
+    /// Transitions into active capture, atomically injecting leading silence + 150ms pre-roll frames before live streaming.
+    /// Returns whether real non-zero audio is already flowing (true => 0ms warm start).
     func startCapture(
         microphoneUID: String,
         sessions: [any VoiceASRSession],
         generation: Int
     ) -> Bool {
-        let (alreadyLive, needDeviceSwitch): (Bool, Bool) = state.withLock { s in
+        let now = CFAbsoluteTimeGetCurrent()
+        let (alreadyLive, needStartOrSwitch): (Bool, Bool) = state.withLock { s in
             s.standbyToken &+= 1
             s.captureGeneration = generation
             s.startedForPreRoll = false
@@ -916,10 +1176,13 @@ private final class VoiceAudioRecorder {
 
             if !sameDevice {
                 s.desiredMicUID = microphoneUID
-                s.pending.removeAll(keepingCapacity: true)
-                s.preRollFrames.removeAll(keepingCapacity: true)
-                s.hasSeenLiveAudio = false
-                s.warmupFrameCount = 0
+                s.preRoll.resetAll()
+                s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                s.activation.reset(captureGeneration: generation, startedAt: now)
+            } else if wasRunning && s.activation.isActivated {
+                s.activation.markAlreadyActive(captureGeneration: generation)
+            } else {
+                s.activation.reset(captureGeneration: generation, startedAt: now)
             }
 
             // 1. Inject 120ms leading silence so cloud ASR frontend VAD stabilizes cleanly without clipping first syllable
@@ -930,23 +1193,18 @@ private final class VoiceAudioRecorder {
                 }
             }
 
-            // 2. Flush any pre-roll audio already captured on the same device (skipping pure-zero DMA warmup frames)
-            if wasRunning && !s.preRollFrames.isEmpty {
-                let framesToFlush = Self.trimLeadingAllZeroFrames(s.preRollFrames)
-                for frame in framesToFlush {
-                    for session in sessions {
-                        session.push(pcm16: frame)
-                    }
+            // 2. Flush any rolling 150ms+ pre-roll captured on the same device (or arm cold-start 150ms begin_padding)
+            let preRollFrames = s.preRoll.beginCapture(useRollingPreRoll: wasRunning)
+            for frame in preRollFrames {
+                for session in sessions {
+                    session.push(pcm16: frame)
                 }
-                s.preRollFrames.removeAll(keepingCapacity: true)
-            } else {
-                s.preRollFrames.removeAll(keepingCapacity: true)
             }
 
             // 3. Atomically attach live sessions so the very next callback streams with zero gap
             s.liveSessions = sessions
             s.mode = .capturing
-            return (wasRunning && s.hasSeenLiveAudio, switchNeeded)
+            return (wasRunning && s.activation.isActivated, switchNeeded)
         }
 
         controlQueue.async { [weak self] in
@@ -959,8 +1217,8 @@ private final class VoiceAudioRecorder {
             }
             guard stillThisCapture else { return }
 
-            if needDeviceSwitch || self.activeIOProcID == nil || self.activeMicUID != microphoneUID {
-                if let err = self.ensureHALRunningOnControlQueue(microphoneUID: microphoneUID) {
+            if needStartOrSwitch || self.captureSession?.isRunning != true || self.preparedDesiredMicUID != microphoneUID {
+                if let err = self.ensureCaptureRunningOnControlQueue(microphoneUID: microphoneUID, trigger: "start_capture") {
                     let stillActive = self.state.withLock { s -> Bool in
                         if s.mode == .capturing && s.captureGeneration == generation {
                             s.mode = .idle
@@ -981,44 +1239,45 @@ private final class VoiceAudioRecorder {
         return alreadyLive
     }
 
-    /// Flushes any trailing partial frame to the active sessions, detaches them, and keeps the microphone warm briefly (8s by default, or indefinitely when always-on is enabled).
+    /// Flushes any remaining cold-start padding / trailing partial frame to the active sessions, detaches them,
+    /// and keeps the capture graph hot in `.warmStandby` for 30s (or forever when always-on is enabled) before stopping.
     func finishCaptureAndWarmStandby(duration: TimeInterval = defaultWarmStandbyDuration) {
         let result: (didFinish: Bool, token: Int, keepForever: Bool) = state.withLock { s in
             guard s.mode == .capturing else {
                 s.liveSessions.removeAll()
                 return (false, 0, false)
             }
-            if !s.pending.isEmpty && !s.liveSessions.isEmpty {
-                let padded = s.pending + [Int16](repeating: 0, count: max(0, Self.frameSamples - s.pending.count))
-                for session in s.liveSessions {
-                    session.push(pcm16: padded)
+            let remainingFrames = s.preRoll.flushOnStop()
+            if !remainingFrames.isEmpty && !s.liveSessions.isEmpty {
+                for frame in remainingFrames {
+                    for session in s.liveSessions {
+                        session.push(pcm16: frame)
+                    }
                 }
-                s.pending.removeAll(keepingCapacity: true)
             }
             s.liveSessions.removeAll()
             s.standbyToken &+= 1
             s.mode = .warmStandby
-            s.preRollFrames.removeAll(keepingCapacity: true)
+            s.preRoll.resetAll()
             return (true, s.standbyToken, s.alwaysOnEnabled)
         }
 
         if result.didFinish && !result.keepForever {
-            scheduleStandbyDispose(token: result.token, duration: duration)
+            scheduleStandbyPause(token: result.token, duration: duration)
         }
     }
 
-    /// Stops immediately and releases the CoreAudio HAL IOProc (used on app termination).
+    /// Stops immediately and tears down the `AVCaptureSession` (used on app termination).
     func stopImmediately() {
         state.withLock { s in
             s.alwaysOnEnabled = false
             s.standbyToken &+= 1
             s.mode = .idle
             s.startedForPreRoll = false
-            s.pending.removeAll()
-            s.preRollFrames.removeAll()
+            s.preRoll.resetAll()
+            s.rawFrameAccumulator.removeAll()
             s.liveSessions.removeAll()
-            s.hasSeenLiveAudio = false
-            s.warmupFrameCount = 0
+            s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
         }
 
         controlQueue.sync {
@@ -1026,7 +1285,9 @@ private final class VoiceAudioRecorder {
             self.standbyTimer = nil
             self.wakeRestoreWorkItem?.cancel()
             self.wakeRestoreWorkItem = nil
-            self.stopAndDisposeOnControlQueue()
+            self.topologyDebounceWorkItem?.cancel()
+            self.topologyDebounceWorkItem = nil
+            self.teardownSessionOnControlQueue()
         }
     }
 
@@ -1041,7 +1302,7 @@ private final class VoiceAudioRecorder {
             mElement: kAudioObjectPropertyElementMain
         )
         let devicesBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleHardwareTopologyChangedOnControlQueue()
+            self?.scheduleTopologyReconcileOnControlQueue(reason: "coreaudio_devices_changed")
         }
         if AudioObjectAddPropertyListenerBlock(systemObj, &devicesAddr, controlQueue, devicesBlock) == noErr {
             devicesListListenerBlock = devicesBlock
@@ -1053,10 +1314,32 @@ private final class VoiceAudioRecorder {
             mElement: kAudioObjectPropertyElementMain
         )
         let defaultInBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleHardwareTopologyChangedOnControlQueue()
+            self?.scheduleTopologyReconcileOnControlQueue(reason: "coreaudio_default_input_changed")
         }
         if AudioObjectAddPropertyListenerBlock(systemObj, &defaultInAddr, controlQueue, defaultInBlock) == noErr {
             defaultInputListenerBlock = defaultInBlock
+        }
+
+        let center = NotificationCenter.default
+        deviceConnectedObserver = center.addObserver(
+            forName: AVCaptureDevice.wasConnectedNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let dev = notification.object as? AVCaptureDevice, dev.hasMediaType(.audio) else { return }
+            self?.controlQueue.async {
+                self?.scheduleTopologyReconcileOnControlQueue(reason: "avcapture_connected")
+            }
+        }
+        deviceDisconnectedObserver = center.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let dev = notification.object as? AVCaptureDevice, dev.hasMediaType(.audio) else { return }
+            self?.controlQueue.async {
+                self?.scheduleTopologyReconcileOnControlQueue(reason: "avcapture_disconnected")
+            }
         }
 
         let nc = NSWorkspace.shared.notificationCenter
@@ -1088,6 +1371,12 @@ private final class VoiceAudioRecorder {
             AudioObjectRemovePropertyListenerBlock(systemObj, &addr, controlQueue, block)
             defaultInputListenerBlock = nil
         }
+        let center = NotificationCenter.default
+        if let deviceConnectedObserver { center.removeObserver(deviceConnectedObserver) }
+        if let deviceDisconnectedObserver { center.removeObserver(deviceDisconnectedObserver) }
+        deviceConnectedObserver = nil
+        deviceDisconnectedObserver = nil
+
         let nc = NSWorkspace.shared.notificationCenter
         if let sleepObserver { nc.removeObserver(sleepObserver) }
         if let wakeObserver { nc.removeObserver(wakeObserver) }
@@ -1103,10 +1392,9 @@ private final class VoiceAudioRecorder {
                 s.mode = .idle
                 s.startedForPreRoll = false
             }
-            s.pending.removeAll(keepingCapacity: true)
-            s.preRollFrames.removeAll(keepingCapacity: true)
-            s.hasSeenLiveAudio = false
-            s.warmupFrameCount = 0
+            s.preRoll.resetAll()
+            s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+            s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
         }
 
         controlQueue.async { [weak self] in
@@ -1115,88 +1403,113 @@ private final class VoiceAudioRecorder {
             self.standbyTimer = nil
             self.wakeRestoreWorkItem?.cancel()
             self.wakeRestoreWorkItem = nil
-            self.stopAndDisposeOnControlQueue()
+            self.topologyDebounceWorkItem?.cancel()
+            self.topologyDebounceWorkItem = nil
+            self.teardownSessionOnControlQueue()
         }
     }
 
     private func handleSystemDidWake() {
-        let (shouldRestore, micUID): (Bool, String) = state.withLock { s in
+        let (shouldRestoreAlwaysOn, micUID): (Bool, String) = state.withLock { s in
             s.isSystemSleeping = false
             return (s.alwaysOnEnabled && s.mode == .idle, s.desiredMicUID)
         }
-        guard shouldRestore else { return }
 
         controlQueue.async { [weak self] in
             guard let self else { return }
             self.wakeRestoreWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
-                let (stillNeed, uid): (Bool, String) = self.state.withLock { s in
-                    guard s.alwaysOnEnabled && !s.isSystemSleeping && s.mode == .idle else {
-                        return (false, "")
+                if shouldRestoreAlwaysOn {
+                    let (stillNeed, uid): (Bool, String) = self.state.withLock { s in
+                        guard s.alwaysOnEnabled && !s.isSystemSleeping && s.mode == .idle else {
+                            return (false, "")
+                        }
+                        s.mode = .warmStandby
+                        s.preRoll.resetAll()
+                        s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                        s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
+                        return (true, s.desiredMicUID)
                     }
-                    s.mode = .warmStandby
-                    s.pending.removeAll(keepingCapacity: true)
-                    s.preRollFrames.removeAll(keepingCapacity: true)
-                    s.hasSeenLiveAudio = false
-                    s.warmupFrameCount = 0
-                    return (true, s.desiredMicUID)
-                }
-                if stillNeed {
-                    _ = self.ensureHALRunningOnControlQueue(microphoneUID: uid)
+                    if stillNeed {
+                        _ = self.ensureCaptureRunningOnControlQueue(microphoneUID: uid, trigger: "system_wake_always_on")
+                    }
+                } else if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+                    let canPrewarm = self.state.withLock { $0.mode == .idle && !$0.isSystemSleeping }
+                    if canPrewarm {
+                        _ = self.prepareCaptureGraphOnControlQueue(microphoneUID: micUID, trigger: "system_wake")
+                    }
                 }
             }
             self.wakeRestoreWorkItem = work
-            // Give USB / CoreAudio ~1.0s after Mac wake to finish re-enumerating audio interfaces
+            // Give USB / Bluetooth / CoreAudio ~1.0s after Mac wake to finish re-enumerating audio interfaces
             self.controlQueue.asyncAfter(deadline: .now() + 1.0, execute: work)
         }
     }
 
-    private func handleHardwareTopologyChangedOnControlQueue() {
-        let (isActive, desiredUID): (Bool, String) = state.withLock { s in
-            (s.mode != .idle && !s.isSystemSleeping, s.desiredMicUID)
+    private func scheduleTopologyReconcileOnControlQueue(reason: String) {
+        topologyDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.handleHardwareTopologyChangedOnControlQueue(reason: reason)
         }
-        guard isActive else { return }
+        topologyDebounceWorkItem = work
+        controlQueue.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
 
-        guard let resolvedID = Self.resolveInputDevice(uid: desiredUID) else {
-            stopAndDisposeOnControlQueue()
+    private func handleHardwareTopologyChangedOnControlQueue(reason: String) {
+        let (mode, sleeping, desiredUID): (Mode, Bool, String) = state.withLock { s in
+            (s.mode, s.isSystemSleeping, s.desiredMicUID)
+        }
+        guard !sleeping else { return }
+
+        guard let resolved = Self.resolveCaptureDevice(uid: desiredUID) else {
+            if mode != .idle {
+                teardownSessionOnControlQueue()
+            }
             return
         }
 
-        // Automatically reconnect when preferred USB mic is plugged back in,
-        // or switch seamlessly when the active device was unplugged / default input changed.
-        if resolvedID != activeDeviceID || activeIOProcID == nil {
-            state.withLock { s in
-                s.pending.removeAll(keepingCapacity: true)
-                s.preRollFrames.removeAll(keepingCapacity: true)
-                s.hasSeenLiveAudio = false
-                s.warmupFrameCount = 0
+        let currentValid = (captureSession != nil)
+            && (preparedDeviceUID == resolved.uniqueID)
+            && (captureInput?.device.isConnected == true)
+
+        if mode != .idle {
+            if !currentValid || captureSession?.isRunning != true {
+                state.withLock { s in
+                    s.preRoll.resetAll()
+                    s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                    s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
+                }
+                _ = ensureCaptureRunningOnControlQueue(microphoneUID: desiredUID, trigger: reason)
             }
-            _ = ensureHALRunningOnControlQueue(microphoneUID: desiredUID)
+        } else if !currentValid, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            // Device plugged in or default input switched while idle (e.g. AirPods connected):
+            // quietly re-prewarm the capture graph (`captureStarted = false`) so the next keypress is instant.
+            _ = prepareCaptureGraphOnControlQueue(microphoneUID: desiredUID, trigger: reason)
         }
     }
 
-    // MARK: - Internal CoreAudio HAL Control & Processing
+    // MARK: - Internal AVCaptureSession Control & Reuse
 
-    private func scheduleStandbyDispose(token: Int, duration: TimeInterval) {
+    private func scheduleStandbyPause(token: Int, duration: TimeInterval) {
         controlQueue.async { [weak self] in
             guard let self else { return }
             self.standbyTimer?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
-                let shouldDispose = self.state.withLock { s -> Bool in
+                let shouldStopRunning = self.state.withLock { s -> Bool in
                     if s.mode == .warmStandby && !s.alwaysOnEnabled && s.standbyToken == token {
                         s.mode = .idle
-                        s.pending.removeAll(keepingCapacity: true)
-                        s.preRollFrames.removeAll(keepingCapacity: true)
-                        s.hasSeenLiveAudio = false
-                        s.warmupFrameCount = 0
+                        s.preRoll.resetAll()
+                        s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                        s.activation.reset(captureGeneration: s.captureGeneration, startedAt: CFAbsoluteTimeGetCurrent())
                         return true
                     }
                     return false
                 }
-                if shouldDispose {
-                    self.stopAndDisposeOnControlQueue()
+                if shouldStopRunning {
+                    // Stop capture (turns off macOS mic indicator) but retain the prewarmed AVCaptureSession graph!
+                    self.stopRunningKeepingGraphOnControlQueue()
                 }
             }
             self.standbyTimer = work
@@ -1204,246 +1517,297 @@ private final class VoiceAudioRecorder {
         }
     }
 
+    /// Builds (or verifies reuse of) the `AVCaptureSession` + `AVCaptureDeviceInput` + `AVCaptureAudioDataOutput` graph
+    /// on `controlQueue` WITHOUT starting capture (`captureStarted = false`).
     @discardableResult
-    private func ensureHALRunningOnControlQueue(microphoneUID: String) -> Error? {
-        guard let targetDeviceID = Self.resolveInputDevice(uid: microphoneUID) else {
+    private func prepareCaptureGraphOnControlQueue(microphoneUID: String, trigger: String) -> Error? {
+        NSLog("[VoicePrewarm] inventory_query_requested trigger=%@", trigger)
+
+        guard let device = Self.resolveCaptureDevice(uid: microphoneUID) else {
+            NSLog("[VoicePrewarm] skip reason=device_unavailable deviceUID=%@", microphoneUID)
             return NSError(domain: "VoiceAudioRecorder", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "未找到可用的麦克风输入设备"
             ])
         }
 
-        if activeIOProcID != nil && activeDeviceID == targetDeviceID && activeMicUID == microphoneUID {
+        // Reuse existing capture graph if already bound to the exact same connected device
+        if captureSession != nil,
+           preparedDeviceUID == device.uniqueID,
+           captureInput?.device.isConnected == true {
+            preparedDesiredMicUID = microphoneUID
             return nil
         }
 
-        stopAndDisposeOnControlQueue()
+        teardownSessionOnControlQueue()
 
-        guard let streamFormat = Self.inputStreamFormat(for: targetDeviceID) else {
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: device)
+        } catch {
+            NSLog("[VoicePrewarm] input_creation_failed deviceUID=%@ error=%@", device.uniqueID, error.localizedDescription)
             return NSError(domain: "VoiceAudioRecorder", code: -2, userInfo: [
-                NSLocalizedDescriptionKey: "无法读取麦克风音频格式"
+                NSLocalizedDescriptionKey: "无法打开麦克风设备：\(error.localizedDescription)"
             ])
         }
 
-        // Configure downmixer & AudioConverter on audioCallbackQueue before starting IOProc
-        audioCallbackQueue.sync {
-            self.activeStreamFormat = streamFormat
-            self.downmixer.reset()
-            self.resampler = MemoryAudioConverterResampler(sourceSampleRate: streamFormat.mSampleRate)
-            self.monoScratch.removeAll(keepingCapacity: true)
-            self.resampledScratch.removeAll(keepingCapacity: true)
-        }
+        let session = AVCaptureSession()
+        let output = AVCaptureAudioDataOutput()
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: Double(VoicePreRollBuffer.sampleRate),
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        output.setSampleBufferDelegate(self, queue: sampleBufferQueue)
 
-        var procID: AudioDeviceIOProcID?
-        let createStatus = AudioDeviceCreateIOProcIDWithBlock(&procID, targetDeviceID, audioCallbackQueue) { [weak self] _, inInputData, _, _, _ in
-            guard let self else { return }
-            self.handleHALInputBuffer(inInputData)
-        }
-        guard createStatus == noErr, let procID else {
-            return NSError(domain: "VoiceAudioRecorder", code: Int(createStatus), userInfo: [
-                NSLocalizedDescriptionKey: "麦克风采集通道创建失败 (\(createStatus))"
+        session.beginConfiguration()
+        guard session.canAddInput(input) else {
+            session.commitConfiguration()
+            return NSError(domain: "VoiceAudioRecorder", code: -3, userInfo: [
+                NSLocalizedDescriptionKey: "无法连接麦克风采集输入"
             ])
         }
+        session.addInput(input)
 
-        state.withLock { s in
-            s.pending.removeAll(keepingCapacity: true)
-            s.hasSeenLiveAudio = false
-            s.warmupFrameCount = 0
-        }
-
-        let startStatus = AudioDeviceStart(targetDeviceID, procID)
-        guard startStatus == noErr else {
-            AudioDeviceDestroyIOProcID(targetDeviceID, procID)
-            return NSError(domain: "VoiceAudioRecorder", code: Int(startStatus), userInfo: [
-                NSLocalizedDescriptionKey: "麦克风启动失败 (\(startStatus))"
+        guard session.canAddOutput(output) else {
+            session.commitConfiguration()
+            return NSError(domain: "VoiceAudioRecorder", code: -4, userInfo: [
+                NSLocalizedDescriptionKey: "无法连接音频采集输出"
             ])
         }
+        session.addOutput(output)
+        session.commitConfiguration()
 
-        activeDeviceID = targetDeviceID
-        activeIOProcID = procID
-        activeMicUID = microphoneUID
-        installDeviceListeners(for: targetDeviceID)
+        sampleBufferQueue.sync {
+            self.fallbackDownmixer.reset()
+            self.fallbackResampler = nil
+            self.fallbackSourceRate = 0
+            self.fallbackMonoScratch.removeAll(keepingCapacity: true)
+            self.fallbackResampledScratch.removeAll(keepingCapacity: true)
+            self.fastInt16Scratch.removeAll(keepingCapacity: true)
+        }
+
+        captureSession = session
+        captureInput = input
+        captureOutput = output
+        preparedDeviceUID = device.uniqueID
+        preparedDesiredMicUID = microphoneUID
+
+        let isBT = Self.isBluetoothDevice(device)
+        NSLog(
+            "[VoicePrewarm] preparation_complete captureStarted=false mixerInitializedNow=1 trigger=%@ deviceUID=%@ bluetooth=%d",
+            trigger,
+            device.uniqueID,
+            isBT ? 1 : 0
+        )
         return nil
     }
 
-    private func installDeviceListeners(for deviceID: AudioDeviceID) {
-        var aliveAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsAlive,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let aliveBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            guard let self else { return }
-            var alive: UInt32 = 1
-            var size = UInt32(MemoryLayout<UInt32>.size)
-            var checkAddr = aliveAddr
-            let status = AudioObjectGetPropertyData(deviceID, &checkAddr, 0, nil, &size, &alive)
-            if status != noErr || alive == 0 {
-                self.handleActiveDeviceDisconnected(deviceID)
+    @discardableResult
+    private func ensureCaptureRunningOnControlQueue(microphoneUID: String, trigger: String) -> Error? {
+        if let err = prepareCaptureGraphOnControlQueue(microphoneUID: microphoneUID, trigger: trigger) {
+            return err
+        }
+        guard let session = captureSession else {
+            return NSError(domain: "VoiceAudioRecorder", code: -5, userInfo: [
+                NSLocalizedDescriptionKey: "音频采集会话未就绪"
+            ])
+        }
+
+        if !session.isRunning {
+            let startT0 = CFAbsoluteTimeGetCurrent()
+            state.withLock { s in
+                s.rawFrameAccumulator.removeAll(keepingCapacity: true)
+                s.activation.reset(captureGeneration: s.captureGeneration, startedAt: startT0)
+            }
+            session.startRunning()
+            let startMs = (CFAbsoluteTimeGetCurrent() - startT0) * 1000.0
+            NSLog(
+                "[AVCaptureSessionAudioRecorder] session_start_running trigger=%@ running=%d startRunningMs=%.1f",
+                trigger,
+                session.isRunning ? 1 : 0,
+                startMs
+            )
+            if !session.isRunning {
+                return NSError(domain: "VoiceAudioRecorder", code: -6, userInfo: [
+                    NSLocalizedDescriptionKey: "麦克风采集启动失败，请检查麦克风连接或权限"
+                ])
             }
         }
-        if AudioObjectAddPropertyListenerBlock(deviceID, &aliveAddr, controlQueue, aliveBlock) == noErr {
-            aliveListenerBlock = aliveBlock
-        }
+        return nil
+    }
 
-        // Listen for external sample rate changes (e.g. Zoom / Tencent Meeting forcing 16kHz/24kHz)
-        var rateAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let rateBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleActiveDeviceFormatChanged(deviceID)
-        }
-        if AudioObjectAddPropertyListenerBlock(deviceID, &rateAddr, controlQueue, rateBlock) == noErr {
-            sampleRateListenerBlock = rateBlock
-        }
-
-        var fmtAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamFormat,
-            mScope: kAudioDevicePropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let fmtBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleActiveDeviceFormatChanged(deviceID)
-        }
-        if AudioObjectAddPropertyListenerBlock(deviceID, &fmtAddr, controlQueue, fmtBlock) == noErr {
-            streamFormatListenerBlock = fmtBlock
+    /// Stops hardware capture (turns off macOS mic indicator) while retaining the prewarmed `AVCaptureSession` graph.
+    private func stopRunningKeepingGraphOnControlQueue() {
+        if let session = captureSession, session.isRunning {
+            session.stopRunning()
+            NSLog("[AVCaptureSessionAudioRecorder] session_stopped_graph_retained deviceUID=%@", preparedDeviceUID ?? "")
         }
     }
 
-    private func removeDeviceListeners() {
-        guard activeDeviceID != kAudioObjectUnknown else { return }
-        if let block = aliveListenerBlock {
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsAlive,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            AudioObjectRemovePropertyListenerBlock(activeDeviceID, &addr, controlQueue, block)
-            aliveListenerBlock = nil
+    /// Completely tears down the `AVCaptureSession` (used on device switch, sleep, or shutdown).
+    private func teardownSessionOnControlQueue() {
+        if let output = captureOutput {
+            output.setSampleBufferDelegate(nil, queue: nil)
         }
-        if let block = sampleRateListenerBlock {
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyNominalSampleRate,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            AudioObjectRemovePropertyListenerBlock(activeDeviceID, &addr, controlQueue, block)
-            sampleRateListenerBlock = nil
-        }
-        if let block = streamFormatListenerBlock {
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyStreamFormat,
-                mScope: kAudioObjectPropertyScopeInput,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            AudioObjectRemovePropertyListenerBlock(activeDeviceID, &addr, controlQueue, block)
-            streamFormatListenerBlock = nil
-        }
-    }
-
-    private func handleActiveDeviceFormatChanged(_ deviceID: AudioDeviceID) {
-        guard activeDeviceID == deviceID, activeIOProcID != nil else { return }
-        guard let newFormat = Self.inputStreamFormat(for: deviceID) else { return }
-
-        audioCallbackQueue.sync {
-            let rateChanged = abs(self.activeStreamFormat.mSampleRate - newFormat.mSampleRate) >= 1.0
-            let layoutChanged = (self.activeStreamFormat.mChannelsPerFrame != newFormat.mChannelsPerFrame)
-                || (self.activeStreamFormat.mFormatFlags != newFormat.mFormatFlags)
-                || (self.activeStreamFormat.mBitsPerChannel != newFormat.mBitsPerChannel)
-            guard rateChanged || layoutChanged else { return }
-
-            self.activeStreamFormat = newFormat
-            if layoutChanged {
-                self.downmixer.reset()
+        if let session = captureSession {
+            if session.isRunning {
+                session.stopRunning()
             }
-            if rateChanged {
-                self.resampler = MemoryAudioConverterResampler(sourceSampleRate: newFormat.mSampleRate)
+            session.beginConfiguration()
+            for input in session.inputs {
+                session.removeInput(input)
             }
+            for output in session.outputs {
+                session.removeOutput(output)
+            }
+            session.commitConfiguration()
         }
+        captureSession = nil
+        captureInput = nil
+        captureOutput = nil
+        preparedDeviceUID = nil
+        preparedDesiredMicUID = nil
     }
 
-    private func handleActiveDeviceDisconnected(_ deviceID: AudioDeviceID) {
-        guard activeDeviceID == deviceID else { return }
-        stopAndDisposeOnControlQueue()
+    // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate (runs on sampleBufferQueue)
 
-        let (shouldRestart, fallbackUID): (Bool, String) = state.withLock { s in
-            s.pending.removeAll(keepingCapacity: true)
-            s.preRollFrames.removeAll(keepingCapacity: true)
-            s.hasSeenLiveAudio = false
-            s.warmupFrameCount = 0
-            return (s.mode != .idle && !s.isSystemSleeping, s.desiredMicUID)
-        }
-        if shouldRestart {
-            _ = ensureHALRunningOnControlQueue(microphoneUID: fallbackUID)
-        }
-    }
-
-    private func stopAndDisposeOnControlQueue() {
-        removeDeviceListeners()
-        guard activeDeviceID != kAudioObjectUnknown, let procID = activeIOProcID else {
-            activeDeviceID = kAudioObjectUnknown
-            activeIOProcID = nil
-            activeMicUID = nil
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
             return
         }
-        let devID = activeDeviceID
-        activeDeviceID = kAudioObjectUnknown
-        activeIOProcID = nil
-        activeMicUID = nil
-        _ = AudioDeviceStop(devID, procID)
-        _ = AudioDeviceDestroyIOProcID(devID, procID)
+        let asbd = asbdPtr.pointee
+
+        var bufferListSizeNeeded: Int = 0
+        let queryStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &bufferListSizeNeeded,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil
+        )
+        guard queryStatus == noErr, bufferListSizeNeeded > 0 else { return }
+
+        let rawABL = UnsafeMutableRawPointer.allocate(
+            byteCount: bufferListSizeNeeded,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawABL.deallocate() }
+
+        let ablPtr = rawABL.assumingMemoryBound(to: AudioBufferList.self)
+        var retainedBlock: CMBlockBuffer?
+        let copyStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: ablPtr,
+            bufferListSize: bufferListSizeNeeded,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &retainedBlock
+        )
+        guard copyStatus == noErr else { return }
+
+        withExtendedLifetime(retainedBlock) {
+            let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+            let isBigEndian = (asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0
+
+            // Fast path: AVCaptureAudioDataOutput mixer delivered 16kHz / Mono / Int16 directly
+            if asbd.mFormatID == kAudioFormatLinearPCM,
+               !isFloat, !isBigEndian,
+               asbd.mBitsPerChannel == 16,
+               asbd.mChannelsPerFrame == 1,
+               abs(asbd.mSampleRate - Double(VoicePreRollBuffer.sampleRate)) < 1.0 {
+                let list = UnsafeMutableAudioBufferListPointer(ablPtr)
+                guard let first = list.first, let dataPtr = first.mData, first.mDataByteSize >= 2 else { return }
+                let sampleCount = Int(first.mDataByteSize) / MemoryLayout<Int16>.size
+                let typed = dataPtr.assumingMemoryBound(to: Int16.self)
+                fastInt16Scratch.removeAll(keepingCapacity: true)
+                fastInt16Scratch.append(contentsOf: UnsafeBufferPointer(start: typed, count: sampleCount))
+                handle16kInt16Samples(fastInt16Scratch)
+                return
+            }
+
+            // Fallback path: hardware/virtual mic delivered native format (e.g. 48kHz Float32 / stereo)
+            fallbackDownmixer.extractMonoFloats(from: UnsafePointer(ablPtr), format: asbd, into: &fallbackMonoScratch)
+            guard !fallbackMonoScratch.isEmpty else { return }
+            if fallbackResampler == nil || abs(fallbackSourceRate - asbd.mSampleRate) >= 1.0 {
+                fallbackSourceRate = asbd.mSampleRate
+                fallbackResampler = MemoryAudioConverterResampler(sourceSampleRate: asbd.mSampleRate)
+            }
+            fallbackResampledScratch.removeAll(keepingCapacity: true)
+            fallbackResampler?.process(fallbackMonoScratch, into: &fallbackResampledScratch)
+            guard !fallbackResampledScratch.isEmpty else { return }
+            handle16kInt16Samples(fallbackResampledScratch)
+        }
     }
 
-    /// Runs on `audioCallbackQueue` (dispatched off CoreAudio's real-time IO thread by HAL).
-    private func handleHALInputBuffer(_ inputData: UnsafePointer<AudioBufferList>) {
-        downmixer.extractMonoFloats(from: inputData, format: activeStreamFormat, into: &monoScratch)
-        guard !monoScratch.isEmpty else { return }
+    private func handle16kInt16Samples(_ samples: [Int16]) {
+        guard !samples.isEmpty else { return }
+        let now = CFAbsoluteTimeGetCurrent()
 
-        resampledScratch.removeAll(keepingCapacity: true)
-        resampler.process(monoScratch, into: &resampledScratch)
-        guard !resampledScratch.isEmpty else { return }
-
-        let (readyGenToNotify, latestLevelToNotify): (Int?, Float?) = state.withLock { s in
-            guard s.mode != .idle else { return (nil, nil) }
+        let (readyGenToNotify, latestLevelToNotify, logsToEmit): (Int?, Float?, [String]) = state.withLock { s in
+            guard s.mode != .idle else { return (nil, nil, []) }
 
             var readyGen: Int?
             var latestLevel: Float?
+            var logs: [String] = []
 
-            s.pending.append(contentsOf: resampledScratch)
-            while s.pending.count >= Self.frameSamples {
-                let frame = Array(s.pending.prefix(Self.frameSamples))
-                s.pending.removeFirst(Self.frameSamples)
+            s.rawFrameAccumulator.append(contentsOf: samples)
+            while s.rawFrameAccumulator.count >= Self.frameSamples {
+                let frame = Array(s.rawFrameAccumulator.prefix(Self.frameSamples))
+                s.rawFrameAccumulator.removeFirst(Self.frameSamples)
 
-                if !s.hasSeenLiveAudio {
-                    s.warmupFrameCount += 1
-                    if Self.hasNonZeroSample(frame) || s.warmupFrameCount >= Self.maxZeroWarmupFrames {
-                        s.hasSeenLiveAudio = true
-                        if s.mode == .capturing {
-                            readyGen = s.captureGeneration
-                        }
-                    }
+                let step = s.activation.consume(frame: frame, now: now)
+                if let log = step.eventLog {
+                    logs.append(log)
+                }
+                if step.justConfirmed && s.mode == .capturing {
+                    readyGen = s.captureGeneration
                 }
 
                 switch s.mode {
                 case .capturing:
-                    for session in s.liveSessions {
-                        session.push(pcm16: frame)
+                    // Drop leading all-zero DMA warmup frames until first non-zero PCM (or timeout) confirms activation
+                    if step.shouldDropFrame {
+                        continue
                     }
                     latestLevel = Self.computeLevel(frame)
+                    let readyFrames = s.preRoll.appendCaptureSamples(frame)
+                    for readyFrame in readyFrames {
+                        for session in s.liveSessions {
+                            session.push(pcm16: readyFrame)
+                        }
+                    }
                 case .preRolling:
-                    s.preRollFrames.append(frame)
-                    Self.trimPreRoll(&s.preRollFrames, limit: Self.maxPreRollFrames)
+                    if !step.shouldDropFrame {
+                        s.preRoll.appendRolling(frame, maxSamples: VoicePreRollBuffer.maxHoldPreRollSamples)
+                    }
                 case .warmStandby:
-                    s.preRollFrames.append(frame)
-                    Self.trimPreRoll(&s.preRollFrames, limit: Self.maxStandbyFrames)
+                    if !step.shouldDropFrame {
+                        s.preRoll.appendRolling(frame, maxSamples: VoicePreRollBuffer.beginPaddingSamples)
+                    }
                 case .idle:
                     break
                 }
             }
-            return (readyGen, latestLevel)
+            return (readyGen, latestLevel, logs)
         }
 
+        for log in logsToEmit {
+            NSLog("%@", log)
+        }
         if let gen = readyGenToNotify {
             DispatchQueue.main.async { [weak self] in
                 self?.onMicReady?(gen)
@@ -1456,98 +1820,59 @@ private final class VoiceAudioRecorder {
         }
     }
 
-    private static func trimPreRoll(_ frames: inout [[Int16]], limit: Int) {
-        if frames.count > limit {
-            frames.removeFirst(frames.count - limit)
+    // MARK: - Device Discovery & Bluetooth Helpers
+
+    private static func resolveCaptureDevice(uid: String) -> AVCaptureDevice? {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        let devices = discovery.devices
+
+        if !uid.isEmpty, let matched = devices.first(where: { $0.uniqueID == uid && $0.isConnected }) {
+            return matched
         }
+        if let defaultDev = AVCaptureDevice.default(for: .audio), defaultDev.isConnected {
+            return defaultDev
+        }
+        return devices.first(where: { $0.isConnected })
     }
 
-    private static func resolveInputDevice(uid: String) -> AudioDeviceID? {
-        if !uid.isEmpty {
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+    private static func isBluetoothDevice(_ device: AVCaptureDevice) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var cfUID: CFString = device.uniqueID as CFString
+        var devID: AudioDeviceID = kAudioObjectUnknown
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = withUnsafePointer(to: &cfUID) { ptr in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &addr,
+                UInt32(MemoryLayout<CFString>.size),
+                ptr,
+                &size,
+                &devID
+            )
+        }
+        if status == noErr, devID != kAudioObjectUnknown {
+            var transportAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyTransportType,
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain
             )
-            var cfUID: CFString = uid as CFString
-            var devID: AudioDeviceID = kAudioObjectUnknown
-            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-            let status = withUnsafePointer(to: &cfUID) { ptr in
-                AudioObjectGetPropertyData(
-                    AudioObjectID(kAudioObjectSystemObject),
-                    &addr,
-                    UInt32(MemoryLayout<CFString>.size),
-                    ptr,
-                    &size,
-                    &devID
-                )
-            }
-            if status == noErr, devID != kAudioObjectUnknown, VoiceMicrophoneDevice.hasInputChannels(devID) {
-                return devID
+            var transport: UInt32 = 0
+            var tSize = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(devID, &transportAddr, 0, nil, &tSize, &transport) == noErr {
+                return transport == kAudioDeviceTransportTypeBluetooth
+                    || transport == kAudioDeviceTransportTypeBluetoothLE
             }
         }
-
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var devID: AudioDeviceID = kAudioObjectUnknown
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &devID) == noErr,
-              devID != kAudioObjectUnknown,
-              VoiceMicrophoneDevice.hasInputChannels(devID) else {
-            return nil
-        }
-        return devID
-    }
-
-    private static func inputStreamFormat(for deviceID: AudioDeviceID) -> AudioStreamBasicDescription? {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamFormat,
-            mScope: kAudioDevicePropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var format = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        if AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &format) == noErr, format.mSampleRate > 0 {
-            return format
-        }
-
-        // Fallback: query nominal sample rate and assume standard HAL 32-bit float mono
-        var rateAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var sampleRate: Float64 = 0
-        var rateSize = UInt32(MemoryLayout<Float64>.size)
-        guard AudioObjectGetPropertyData(deviceID, &rateAddr, 0, nil, &rateSize, &sampleRate) == noErr,
-              sampleRate > 0 else {
-            return nil
-        }
-        return AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: 1,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-    }
-
-    private static func hasNonZeroSample(_ frame: [Int16]) -> Bool {
-        frame.contains { $0 != 0 }
-    }
-
-    private static func trimLeadingAllZeroFrames(_ frames: [[Int16]]) -> [[Int16]] {
-        guard let firstLiveIdx = frames.firstIndex(where: { hasNonZeroSample($0) }) else {
-            return []
-        }
-        return Array(frames[firstLiveIdx...])
+        let lower = device.localizedName.lowercased()
+        return lower.contains("airpods") || lower.contains("bluetooth") || lower.contains("beats")
     }
 
     static func computeLevel(_ frame: [Int16]) -> Float {

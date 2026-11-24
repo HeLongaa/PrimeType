@@ -18,6 +18,7 @@ final class InputTypeController: IMKInputController {
     private weak var currentClient: (any IMKTextInput)?
     private var pendingCommandKeyCode: UInt16?
     private var currentPreedit: String = ""
+    private var currentPreeditSelStart: Int = 0
     private var currentCandidates: [RimeCandidateItem] = []
     private var currentRimeCandidates: [RimeCandidateItem] = []
     private var currentPresentedCandidates: [PresentedCandidate] = []
@@ -2580,8 +2581,9 @@ final class InputTypeController: IMKInputController {
 
     private func selectAllMarkedPreedit(client: (any IMKTextInput)?) {
         guard !currentPreedit.isEmpty else { return }
-        let totalUTF16 = currentPreedit.utf16.count
-        let attrStr = NSMutableAttributedString(string: currentPreedit)
+        let displayPreedit = Self.formatDisplayPreedit(currentPreedit, selStartUTF8: currentPreeditSelStart)
+        let totalUTF16 = displayPreedit.utf16.count
+        let attrStr = NSMutableAttributedString(string: displayPreedit)
         let fullRange = NSRange(location: 0, length: totalUTF16)
         if let attrs = mark(forStyle: Int(kTSMHiliteSelectedRawText), at: fullRange) as? [NSAttributedString.Key: Any] {
             attrStr.setAttributes(attrs, range: fullRange)
@@ -2868,8 +2870,48 @@ final class InputTypeController: IMKInputController {
         return strIndex.utf16Offset(in: string)
     }
 
+    private static func isPinyinSyllableCharacter(_ ch: Character) -> Bool {
+        guard let scalar = ch.unicodeScalars.first else { return false }
+        let v = scalar.value
+        if (0x41...0x5A).contains(v) || (0x61...0x7A).contains(v) {
+            return true
+        }
+        // Pinyin ü and tone-marked Latin vowels (e.g. ā á ǎ à ō ó ǒ ò ē é ě è ī í ǐ ì ū ú ǔ ù ǖ ǘ ǚ ǜ)
+        return (0x00C0...0x024F).contains(v)
+    }
+
+    /// Formats Rime's space-delimited unconverted pinyin syllables with visible `'` separators
+    /// (e.g. `xian zai shi shi` -> `xian'zai'shi'shi`), while keeping converted text untouched
+    /// and preserving 1:1 UTF-8 and UTF-16 byte lengths for exact cursor/selection mapping.
+    static func formatDisplayPreedit(_ preedit: String, selStartUTF8: Int) -> String {
+        guard preedit.contains(" ") else { return preedit }
+        let clampedUTF8 = max(0, min(selStartUTF8, preedit.utf8.count))
+        let utf8Idx = preedit.utf8.index(preedit.utf8.startIndex, offsetBy: clampedUTF8)
+        let rawStart = String.Index(utf8Idx, within: preedit) ?? preedit.startIndex
+
+        let convertedPrefix = preedit[..<rawStart]
+        let rawChars = Array(preedit[rawStart...])
+        guard !rawChars.isEmpty else { return preedit }
+
+        var formatted = String(convertedPrefix)
+        formatted.reserveCapacity(preedit.count)
+        for i in 0..<rawChars.count {
+            let ch = rawChars[i]
+            if ch == " ",
+               i > 0, i + 1 < rawChars.count,
+               isPinyinSyllableCharacter(rawChars[i - 1]),
+               isPinyinSyllableCharacter(rawChars[i + 1]) {
+                formatted.append("'")
+            } else {
+                formatted.append(ch)
+            }
+        }
+        return formatted
+    }
+
     private func updateMarkedText(_ context: RimeContextSnapshot, client: (any IMKTextInput)?) {
-        let preedit = context.preedit
+        currentPreeditSelStart = context.selStart
+        let preedit = Self.formatDisplayPreedit(context.preedit, selStartUTF8: context.selStart)
         let totalUTF16 = preedit.utf16.count
         let selStartUTF16 = utf16Offset(fromUTF8Offset: context.selStart, in: preedit)
         let cursorUTF16 = utf16Offset(fromUTF8Offset: context.cursorPos, in: preedit)

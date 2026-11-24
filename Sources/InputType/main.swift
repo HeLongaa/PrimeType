@@ -142,6 +142,71 @@ if CommandLine.arguments.contains("--self-test-experience") {
     let afterOnePick = calmRanking.rerank(candidates: calmCands, code: "dadao", now: t0 + 1)
     assertCheck(afterOnePick.first?.text == "达到", "Smoothed UserRankingEngine does not overreact to a single selection")
 
+    // 10. Visible pinyin syllable delimiter formatting (`xian zai shi shi` -> `xian'zai'shi'shi`) with exact UTF-8/UTF-16 alignment
+    let rawPre1 = "xian zai shi shi"
+    let fmtPre1 = InputTypeController.formatDisplayPreedit(rawPre1, selStartUTF8: 0)
+    let rawPre2 = "现在shi shi"
+    let fmtPre2 = InputTypeController.formatDisplayPreedit(rawPre2, selStartUTF8: "现在".utf8.count)
+    let rawPre3 = "Hello World xian zai"
+    let fmtPre3 = InputTypeController.formatDisplayPreedit(rawPre3, selStartUTF8: "Hello World ".utf8.count)
+    assertCheck(
+        fmtPre1 == "xian'zai'shi'shi"
+        && fmtPre1.utf8.count == rawPre1.utf8.count
+        && fmtPre1.utf16.count == rawPre1.utf16.count
+        && fmtPre2 == "现在shi'shi"
+        && fmtPre3 == "Hello World xian'zai",
+        "Preedit syllable delimiter displays apostrophe cleanly with exact offset preservation"
+    )
+
+    // 11. VoiceActivationTracker (Layer 3): all-zero PCM warmup -> first non-zero confirmation + 300ms timeout fallback
+    var tracker = VoiceActivationTracker()
+    tracker.reset(captureGeneration: 1, startedAt: 100.0)
+    let zeroFrame = [Int16](repeating: 0, count: VoicePreRollBuffer.frameSamples)
+    let liveFrame = [Int16](repeating: 1200, count: VoicePreRollBuffer.frameSamples)
+    let s1 = tracker.consume(frame: zeroFrame, now: 100.02)
+    let s2 = tracker.consume(frame: zeroFrame, now: 100.04)
+    let s3 = tracker.consume(frame: liveFrame, now: 100.06)
+    var timeoutTracker = VoiceActivationTracker()
+    timeoutTracker.reset(captureGeneration: 2, startedAt: 200.0)
+    var lastTimeoutStep = VoiceActivationTracker.StepOutcome(isActivated: false, justConfirmed: false, shouldDropFrame: true, eventLog: nil)
+    for i in 1...VoiceActivationTracker.maxZeroWarmupFrames {
+        lastTimeoutStep = timeoutTracker.consume(frame: zeroFrame, now: 200.0 + Double(i) * 0.02)
+    }
+    assertCheck(
+        !s1.isActivated && s1.shouldDropFrame && (s1.eventLog?.contains("all_zero_pcm_started") == true)
+        && !s2.isActivated && s2.shouldDropFrame
+        && s3.isActivated && s3.justConfirmed && !s3.shouldDropFrame && (s3.eventLog?.contains("activation_nonzero_pcm_confirmed") == true)
+        && lastTimeoutStep.isActivated && lastTimeoutStep.justConfirmed && (lastTimeoutStep.eventLog?.contains("nonzero_pcm_timeout") == true),
+        "VoiceActivationTracker distinguishes all-zero DMA warmup from first non-zero PCM and handles timeout"
+    )
+
+    // 12. VoicePreRollBuffer (Layer 4): 150ms (2400-sample) rolling pre-roll & cold-start begin-padding + short-stop flush
+    var preRollBuf = VoicePreRollBuffer()
+    for _ in 0..<10 {
+        preRollBuf.appendRolling(liveFrame, maxSamples: VoicePreRollBuffer.beginPaddingSamples)
+    }
+    let rollingCount = preRollBuf.rollingSampleCount
+    let flushedRolling = preRollBuf.beginCapture(useRollingPreRoll: true)
+    var coldBuf = VoicePreRollBuffer()
+    _ = coldBuf.beginCapture(useRollingPreRoll: false)
+    var coldEmitted = 0
+    for _ in 0..<7 { // 7 * 320 = 2240 < 2400
+        coldEmitted += coldBuf.appendCaptureSamples(liveFrame).count
+    }
+    let after8th = coldBuf.appendCaptureSamples(liveFrame).count // 8 * 320 = 2560 >= 2400 -> flushes 8 frames
+    var shortBuf = VoicePreRollBuffer()
+    _ = shortBuf.beginCapture(useRollingPreRoll: false)
+    _ = shortBuf.appendCaptureSamples(liveFrame)
+    let shortFlushed = shortBuf.flushOnStop()
+    assertCheck(
+        rollingCount == VoicePreRollBuffer.beginPaddingSamples
+        && flushedRolling.count == 7
+        && coldEmitted == 0
+        && after8th == 8
+        && shortFlushed.count == 1,
+        "VoicePreRollBuffer enforces 150ms (2400-sample) rolling pre-roll, cold begin-padding, and lossless short-stop flush"
+    )
+
     print(failures.isEmpty ? "SELF_TEST_ALL_PASSED" : "SELF_TEST_FAILED: \(failures.joined(separator: ", "))")
     exit(failures.isEmpty ? 0 : 1)
 }
