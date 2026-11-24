@@ -7,7 +7,7 @@ final class LocalCodeSignManager {
 
     private init() {}
 
-    func isCertificateConfigured() -> Bool {
+    func firstIdentitySHA1() -> String? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         proc.arguments = ["find-identity", "-v", "-p", "codesigning"]
@@ -19,10 +19,23 @@ final class LocalCodeSignManager {
             proc.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
-            return output.contains("\"\(Self.certificateName)\"")
+            for line in output.split(separator: "\n") {
+                if line.contains("\"\(Self.certificateName)\"") {
+                    let tokens = line.split(whereSeparator: { $0.isWhitespace })
+                    // Format: "  1) <40-hex-SHA1> \"PrimeType Local Sign\""
+                    if tokens.count >= 2, tokens[1].count == 40 {
+                        return String(tokens[1])
+                    }
+                }
+            }
+            return nil
         } catch {
-            return false
+            return nil
         }
+    }
+
+    func isCertificateConfigured() -> Bool {
+        firstIdentitySHA1() != nil
     }
 
     func setupCertificateAndSignApp() async throws {
@@ -68,12 +81,14 @@ final class LocalCodeSignManager {
                 "-out", p12URL.path,
                 "-inkey", keyURL.path,
                 "-in", crtURL.path,
-                "-passout", "pass:\(pass)",
-                "-legacy"
+                "-passout", "pass:\(pass)"
             ])
 
             let loginKeychain = fm.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Keychains/login.keychain-db").path
+
+            // Clean any previous duplicate entries first
+            Self.deleteAllMatchingCertificates(in: loginKeychain)
 
             // 2. Import into login keychain and trust for code signing (macOS will prompt once for confirmation)
             try Self.run("/usr/bin/security", [
@@ -98,22 +113,39 @@ final class LocalCodeSignManager {
         try await Task.detached(priority: .userInitiated) {
             let loginKeychain = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Keychains/login.keychain-db").path
-            try Self.run("/usr/bin/security", [
-                "delete-certificate", "-c", Self.certificateName, loginKeychain
-            ])
+            Self.deleteAllMatchingCertificates(in: loginKeychain)
         }.value
     }
 
+    private static func deleteAllMatchingCertificates(in keychain: String) {
+        for _ in 0..<8 {
+            guard let sha1 = shared.firstIdentitySHA1() else { break }
+            do {
+                try run("/usr/bin/security", ["delete-certificate", "-t", "-Z", sha1, keychain])
+            } catch {
+                _ = try? run("/usr/bin/security", ["delete-certificate", "-Z", sha1, keychain])
+                break
+            }
+        }
+        for _ in 0..<4 {
+            do {
+                try run("/usr/bin/security", ["delete-certificate", "-t", "-c", Self.certificateName, keychain])
+            } catch {
+                break
+            }
+        }
+    }
+
     static func resignInstalledAppIfConfigured() throws {
-        guard shared.isCertificateConfigured() else { return }
+        guard let sha1 = shared.firstIdentitySHA1() else { return }
         let appPath = "/Library/Input Methods/PrimeType.app"
         guard FileManager.default.fileExists(atPath: appPath) else { return }
 
         let fm = FileManager.default
         if fm.isWritableFile(atPath: appPath) {
-            try run("/usr/bin/codesign", ["--force", "--deep", "--sign", certificateName, appPath])
+            try run("/usr/bin/codesign", ["--force", "--deep", "--sign", sha1, appPath])
         } else {
-            let cmd = "/usr/bin/codesign --force --deep --sign \"\(certificateName)\" \"\(appPath)\""
+            let cmd = "/usr/bin/codesign --force --deep --sign \"\(sha1)\" \"\(appPath)\""
             let escaped = cmd
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
