@@ -123,6 +123,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
     private let listScrollView = NSScrollView()
     private let tableView = NSTableView()
     private let emptyListLabel = NSTextField(labelWithString: "")
+    private var bottomLeftFilterGlass: NSView!
     private let bottomLeftFilterBtn = ClipboardActionControlView()
     private let splitDivider = NSView()
 
@@ -133,6 +134,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
     private let previewTextView = NSTextView()
     private let metadataStack = ClipboardFlippedView()
     private let emptyDetailLabel = NSTextField(labelWithString: "选择左侧条目查看详情")
+    private var actionPillGlass: NSView!
     private let actionPillHost = ClipboardFlippedView()
     private let pasteActionBtn = ClipboardActionControlView()
     private let pasteTitleLabel = NSTextField(labelWithString: "")
@@ -205,9 +207,12 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         topDivider.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
         addSubview(topDivider)
 
-        // Left list
+        // Left list (explicit `.plain` style prevents macOS 14+/26+ `.inset` from adding extra horizontal padding that clips rows)
+        tableView.style = .plain
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("clip"))
         col.width = 285
+        col.resizingMask = .autoresizingMask
         tableView.addTableColumn(col)
         tableView.headerView = nil
         tableView.backgroundColor = .clear
@@ -224,7 +229,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         listScrollView.autohidesScrollers = true
         listScrollView.drawsBackground = false
         listScrollView.borderType = .noBorder
-        listScrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 54, right: 0)
+        listScrollView.contentInsets = NSEdgeInsets(top: 6, left: 0, bottom: 54, right: 0)
         addSubview(listScrollView)
 
         emptyListLabel.font = .systemFont(ofSize: 13)
@@ -233,12 +238,9 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         emptyListLabel.isHidden = true
         addSubview(emptyListLabel)
 
-        // Bottom-left floating glass circle button
-        bottomLeftFilterBtn.wantsLayer = true
-        bottomLeftFilterBtn.layer?.cornerRadius = 17
-        bottomLeftFilterBtn.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.75).cgColor
-        bottomLeftFilterBtn.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.18).cgColor
-        bottomLeftFilterBtn.layer?.borderWidth = 0.75
+        // Bottom-left floating native Liquid Glass circle button
+        bottomLeftFilterBtn.frame = NSRect(x: 0, y: 0, width: 34, height: 34)
+        bottomLeftFilterBtn.autoresizingMask = [.width, .height]
         bottomLeftFilterBtn.onClick = { [weak self] in self?.showFilterMenu() }
         let line1 = NSView(frame: NSRect(x: 10.5, y: 13.5, width: 13, height: 1.5))
         line1.wantsLayer = true
@@ -250,7 +252,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         line2.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.85).cgColor
         bottomLeftFilterBtn.addSubview(line1)
         bottomLeftFilterBtn.addSubview(line2)
-        addSubview(bottomLeftFilterBtn)
+        bottomLeftFilterGlass = Self.wrapInLiquidGlass(bottomLeftFilterBtn, cornerRadius: 17)
+        addSubview(bottomLeftFilterGlass)
 
         splitDivider.wantsLayer = true
         splitDivider.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
@@ -294,12 +297,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         emptyDetailLabel.alignment = .center
         rightContainer.addSubview(emptyDetailLabel)
 
-        // Floating bottom-right action pill
-        actionPillHost.wantsLayer = true
-        actionPillHost.layer?.cornerRadius = 17
-        actionPillHost.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.78).cgColor
-        actionPillHost.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.16).cgColor
-        actionPillHost.layer?.borderWidth = 0.75
+        // Floating bottom-right native Liquid Glass action pill
+        actionPillHost.autoresizingMask = [.width, .height]
 
         pasteActionBtn.onClick = { [weak self] in
             if let entry = self?.selectedEntry() {
@@ -317,7 +316,38 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             }
         }
         actionPillHost.addSubview(actionsMenuBtn)
-        rightContainer.addSubview(actionPillHost)
+        actionPillGlass = Self.wrapInLiquidGlass(actionPillHost, cornerRadius: 17)
+        rightContainer.addSubview(actionPillGlass)
+    }
+
+    private static func wrapInLiquidGlass(_ content: NSView, cornerRadius: CGFloat) -> NSView {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: content.frame)
+            glass.style = .regular
+            glass.tintColor = nil
+            glass.cornerRadius = cornerRadius
+            glass.wantsLayer = true
+            glass.layer?.cornerCurve = .continuous
+            glass.layer?.cornerRadius = cornerRadius
+            glass.layer?.masksToBounds = true
+            glass.contentView = content
+            return glass
+        } else {
+            let effect = NSVisualEffectView(frame: content.frame)
+            effect.material = .hudWindow
+            effect.blendingMode = .withinWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.layer?.cornerCurve = .continuous
+            effect.layer?.cornerRadius = cornerRadius
+            effect.layer?.masksToBounds = true
+            effect.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.16).cgColor
+            effect.layer?.borderWidth = 0.75
+            content.frame = effect.bounds
+            content.autoresizingMask = [.width, .height]
+            effect.addSubview(content)
+            return effect
+        }
     }
 
     private func bindState() {
@@ -434,7 +464,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             previewImageView.image = nil
             previewTextScroll.isHidden = true
             metadataStack.isHidden = true
-            actionPillHost.isHidden = true
+            actionPillGlass.isHidden = true
             emptyDetailLabel.isHidden = false
             return
         }
@@ -442,7 +472,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         activeDetailEntryID = entry.id
         emptyDetailLabel.isHidden = true
         metadataStack.isHidden = false
-        actionPillHost.isHidden = false
+        actionPillGlass.isHidden = false
 
         if entry.kind == .image {
             previewTextScroll.isHidden = true
@@ -582,7 +612,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         let totalW = divX + 13 + rightW + 14
         let rightWContainer = rightContainer.bounds.width > 0 ? rightContainer.bounds.width : (780 - 286)
         let rightHContainer = rightContainer.bounds.height > 0 ? rightContainer.bounds.height : (500 - 55)
-        actionPillHost.frame = NSRect(x: rightWContainer - 16 - totalW, y: rightHContainer - 14 - 34, width: totalW, height: 34)
+        actionPillGlass.frame = NSRect(x: rightWContainer - 16 - totalW, y: rightHContainer - 14 - 34, width: totalW, height: 34)
+        actionPillHost.frame = actionPillGlass.bounds
     }
 
     private func makeKeyBadge(_ key: String, tint: NSColor) -> NSView {
@@ -625,7 +656,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         listScrollView.frame = NSRect(x: 0, y: bodyY, width: leftW, height: bodyH)
         tableView.tableColumns.first?.width = leftW
         emptyListLabel.frame = NSRect(x: 16, y: bodyY + round((bodyH - 22) * 0.5), width: leftW - 32, height: 22)
-        bottomLeftFilterBtn.frame = NSRect(x: 14, y: h - 14 - 34, width: 34, height: 34)
+        bottomLeftFilterGlass.frame = NSRect(x: 14, y: h - 14 - 34, width: 34, height: 34)
+        bottomLeftFilterBtn.frame = bottomLeftFilterGlass.bounds
         splitDivider.frame = NSRect(x: leftW, y: bodyY, width: 1, height: bodyH)
 
         // Right detail
@@ -663,19 +695,25 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         switch rows[row] {
         case .section(let title):
-            let cell = NSView(frame: NSRect(x: 0, y: 0, width: 285, height: 26))
+            let rowW = max(120, tableView.bounds.width)
+            let cell = NSView(frame: NSRect(x: 0, y: 0, width: rowW, height: 26))
+            cell.autoresizingMask = [.width]
             let lbl = NSTextField(labelWithString: title)
             lbl.font = .systemFont(ofSize: 12, weight: .medium)
             lbl.textColor = .secondaryLabelColor
-            lbl.frame = NSRect(x: 14, y: 4, width: 257, height: 16)
+            lbl.frame = NSRect(x: 16, y: 4, width: rowW - 32, height: 16)
+            lbl.autoresizingMask = [.width]
             cell.addSubview(lbl)
             return cell
 
         case .entry(let entry):
             let isSelected = (selectedEntry()?.id == entry.id)
-            let cell = NSView(frame: NSRect(x: 0, y: 0, width: 285, height: 40))
+            let rowW = max(120, tableView.bounds.width)
+            let cell = NSView(frame: NSRect(x: 0, y: 0, width: rowW, height: 40))
+            cell.autoresizingMask = [.width]
 
-            let bg = NSView(frame: NSRect(x: 8, y: 1, width: 269, height: 38))
+            let bg = NSView(frame: NSRect(x: 8, y: 1, width: rowW - 16, height: 38))
+            bg.autoresizingMask = [.width]
             bg.wantsLayer = true
             bg.layer?.cornerCurve = .continuous
             bg.layer?.cornerRadius = 10
@@ -689,17 +727,19 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             iconBox.layer?.masksToBounds = true
 
             if entry.kind == .image {
-                let iv = NSImageView(frame: iconBox.bounds)
-                iv.imageScaling = .scaleAxesIndependently
+                let thumbLayerHost = NSView(frame: iconBox.bounds)
+                thumbLayerHost.wantsLayer = true
+                thumbLayerHost.layer?.contentsGravity = .resizeAspectFill
+                thumbLayerHost.layer?.masksToBounds = true
                 iconBox.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
                 iconBox.layer?.borderWidth = 0.5
                 iconBox.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
-                iconBox.addSubview(iv)
+                iconBox.addSubview(thumbLayerHost)
                 if let thumb = ClipboardManager.shared.cachedThumbnailImage(for: entry) {
-                    iv.image = thumb
+                    thumbLayerHost.layer?.contents = thumb
                 } else {
-                    ClipboardManager.shared.loadThumbnailImageAsync(for: entry) { [weak iv] loaded in
-                        iv?.image = loaded
+                    ClipboardManager.shared.loadThumbnailImageAsync(for: entry) { [weak thumbLayerHost] loaded in
+                        thumbLayerHost?.layer?.contents = loaded
                     }
                 }
             } else {
@@ -717,7 +757,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             lbl.font = .systemFont(ofSize: 13.5)
             lbl.textColor = .labelColor
             lbl.lineBreakMode = .byTruncatingTail
-            lbl.frame = NSRect(x: 44, y: 11, width: 215, height: 17)
+            lbl.frame = NSRect(x: 44, y: 11, width: max(40, bg.bounds.width - 54), height: 17)
+            lbl.autoresizingMask = [.width]
             bg.addSubview(lbl)
 
             return cell

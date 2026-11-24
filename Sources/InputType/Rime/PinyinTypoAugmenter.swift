@@ -14,9 +14,14 @@ import Foundation
 enum PinyinTypoAugmenter {
     enum Diagnosis: Equatable {
         case none
-        /// Raw input clearly contains invalid/broken fragments (e.g. `wo zai jia ba m`, `n o hao`, `sh jian`).
+        /// Raw input clearly contains interior invalid/broken fragments (e.g. `n o hao`, `sh jian`, `ni h hao`).
         /// Repaired full-sentence candidate should be promoted to Top-1.
         case broken
+        /// All preceding syllables are valid full pinyin and ONLY the trailing segment is a valid Mandarin initial
+        /// (e.g. mid-typing `liang'g` / `zhong'g` / `shen'm` / `wo'men'd`, OR trailing nasal typo `wo'zai'jia'ba'm`).
+        /// Strictly forbids deleting the trailing initial or producing single-syllable overrides; only allows
+        /// same-length multi-syllable coda repairs (e.g. `wozaijiabam` -> `wozaijiaban`).
+        case trailingInitial
         /// Raw input is parseable only via suspicious orphan single-vowel split (e.g. `xian zi a`).
         /// Repaired full-sentence candidate should be promoted strongly (Top-1 or Top-2).
         case suspicious
@@ -53,6 +58,15 @@ enum PinyinTypoAugmenter {
         "xi", "xia", "xian", "xiang", "xiao", "xie", "xin", "xing", "xiong", "xiu", "xu", "xuan", "xue", "xun", "xv", "xvan", "xve", "xvn",
         "ya", "yan", "yang", "yao", "ye", "yi", "yin", "ying", "yo", "yong", "you", "yu", "yuan", "yue", "yun", "yv", "yvan", "yve", "yvn",
         "za", "zai", "zan", "zang", "zao", "ze", "zei", "zen", "zeng", "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhei", "zhen", "zheng", "zhi", "zhong", "zhou", "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou", "zu", "zuan", "zui", "zun", "zuo"
+    ]
+
+    /// Standard 23 Mandarin pinyin initials (声母) that routinely appear at the trailing cursor during
+    /// normal mid-word typing or intentional 全拼+简拼 (e.g. `liang'g` 两个, `zhong'g` 中国, `shen'm` 什么, `xian'zai'sh` 现在是).
+    static let validInitials: Set<String> = [
+        "b", "p", "m", "f", "d", "t", "n", "l",
+        "g", "k", "h", "j", "q", "x",
+        "zh", "ch", "sh", "r", "z", "c", "s",
+        "y", "w"
     ]
 
     private static let vowels: Set<UInt8> = [
@@ -286,19 +300,37 @@ enum PinyinTypoAugmenter {
             .map { $0.lowercased() }
         guard !segments.isEmpty else { return .none }
 
-        var invalidSegmentCount = 0
+        var interiorInvalidCount = 0
+        var trailingInvalid = false
+        var trailingIsValidInitial = false
         var suspiciousSingleVowelSplits = 0
+        let lastIdx = segments.count - 1
         for (idx, seg) in segments.enumerated() {
             if !validSyllables.contains(seg) {
-                invalidSegmentCount += 1
+                if idx == lastIdx {
+                    trailingInvalid = true
+                    trailingIsValidInitial = validInitials.contains(seg)
+                } else {
+                    interiorInvalidCount += 1
+                }
             } else if seg == "o" || (seg == "a" && idx > 0 && segments[idx - 1].hasSuffix("i")) {
                 // `n o`, `zi a`, `ti a`, `xi a` are classic adjacent-key / transposition breakages
                 suspiciousSingleVowelSplits += 1
             }
         }
 
-        if invalidSegmentCount > 0 {
+        if interiorInvalidCount > 0 || (trailingInvalid && !trailingIsValidInitial) {
             return .broken
+        }
+
+        // Only the final segment is a valid Mandarin initial (e.g. `liang'g`, `zhong'g`, `shen'm`, `wo'zai'jia'ba'm`).
+        // Distinguish mid-typing / 全拼+简拼 from trailing coda typos (e.g. `ba m` -> `ban`).
+        if trailingInvalid && trailingIsValidInitial {
+            if suspiciousSingleVowelSplits > 0 {
+                // e.g. `ming ti a m` -> `mingtian`: both a suspicious vowel split AND trailing initial -> clearly broken!
+                return .broken
+            }
+            return .trailingInitial
         }
 
         // Even if Rime forced `xianzia` -> `xian zi a`, check if our strict Mandarin syllable segmenter
@@ -313,7 +345,12 @@ enum PinyinTypoAugmenter {
     // MARK: - Weighted Beam DP Pinyin Repair
 
     /// Generates up to `maxCandidates` repaired full-pinyin strings for a broken/suspicious `rawInput`.
-    static func generateRepairs(rawInput: String, maxCandidates: Int = 3) -> [RepairCandidate] {
+    static func generateRepairs(
+        rawInput: String,
+        diagnosis: Diagnosis = .broken,
+        originalSegmentCount: Int = 0,
+        maxCandidates: Int = 3
+    ) -> [RepairCandidate] {
         let lower = rawInput.lowercased()
         let bytes = Array(lower.utf8)
         let n = bytes.count
@@ -416,6 +453,25 @@ enum PinyinTypoAugmenter {
         }
 
         return bestByJoined.values
+            .filter { cand in
+                if diagnosis == .trailingInitial {
+                    // When all preceding syllables are valid and ONLY the trailing segment is a valid Mandarin initial
+                    // (e.g. `liang'g`, `zhong'g`, `shen'm`, `dian'h`, `xian'z`, `wo'men'd`, `xian'zai'sh`):
+                    // The ONLY valid completed-word typo is a trailing nasal coda typo merging into the preceding
+                    // syllable (e.g. `wo zai jia ba m` [5 segs] -> `wo zai jia ban` [4 syls], ending in `n` or `g`).
+                    // Strictly forbid deleting the trailing initial, inventing a fake trailing syllable (`shenm`->`shehm`,
+                    // `womend`->`womene`, `xianzaish`->`xianzaisu`), or collapsing a 2-segment phrase into 1 syllable.
+                    guard cand.pinyin.count == n, cand.syllableCount >= 2 else { return false }
+                    if originalSegmentCount > 0 && cand.syllableCount != originalSegmentCount - 1 {
+                        return false
+                    }
+                    guard let lastChar = cand.pinyin.last, lastChar == "n" || lastChar == "g" else {
+                        return false
+                    }
+                    return true
+                }
+                return true
+            }
             .sorted { a, b in
                 let sa = a.cost + Double(a.syllableCount) * 0.18
                 let sb = b.cost + Double(b.syllableCount) * 0.18

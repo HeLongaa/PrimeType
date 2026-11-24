@@ -207,31 +207,69 @@ if CommandLine.arguments.contains("--self-test-experience") {
         "VoicePreRollBuffer enforces 150ms (2400-sample) rolling pre-roll, cold begin-padding, and lossless short-stop flush"
     )
 
-    // 13. Plan A PinyinTypoAugmenter: zero false positives on clean pinyin & pure简拼, accurate QWERTY repairs on typos
+    // 13. Plan A PinyinTypoAugmenter: zero false positives on clean pinyin, pure简拼, & mid-typing/全拼+简拼; accurate QWERTY repairs on typos
     assertCheck(
         PinyinTypoAugmenter.diagnose(rawInput: "xianzaishishi", preedit: "xian zai shi shi") == .none
         && PinyinTypoAugmenter.diagnose(rawInput: "mwt", preedit: "m w t") == .none
         && PinyinTypoAugmenter.diagnose(rawInput: "cxy", preedit: "c x y") == .none
-        && PinyinTypoAugmenter.diagnose(rawInput: "wozaijiabam", preedit: "wo zai jia ba m") == .broken
+        && PinyinTypoAugmenter.diagnose(rawInput: "wozaijiabam", preedit: "wo zai jia ba m") == .trailingInitial
+        && PinyinTypoAugmenter.diagnose(rawInput: "liangg", preedit: "liang g") == .trailingInitial
         && PinyinTypoAugmenter.diagnose(rawInput: "nohao", preedit: "n o hao") == .broken
         && PinyinTypoAugmenter.diagnose(rawInput: "shjian", preedit: "sh jian") == .broken
         && PinyinTypoAugmenter.diagnose(rawInput: "xianzia", preedit: "xian zi a") == .suspicious,
-        "PinyinTypoAugmenter cleanly distinguishes normal/abbrev input from mistyped pinyin"
+        "PinyinTypoAugmenter cleanly distinguishes normal/abbrev/trailing-initial input from mistyped pinyin"
     )
-    let repairChecks: [(String, String)] = [
-        ("wozaijiabam", "wozaijiaban"),
-        ("nohao", "nihao"),
-        ("xiamzai", "xianzai"),
-        ("shjian", "shijian"),
-        ("xianzia", "xianzai"),
-        ("mingtiam", "mingtian"),
-        ("shemme", "shenme"),
-        ("wnti", "wenti"),
-        ("weixni", "weixin")
+    let halfTypedCases: [(String, String)] = [
+        ("liangg", "liang g"),
+        ("zhongg", "zhong g"),
+        ("yingg", "ying g"),
+        ("nengg", "neng g"),
+        ("gangg", "gang g"),
+        ("jingg", "jing g"),
+        ("shenm", "shen m"),
+        ("mingt", "ming t"),
+        ("dianh", "dian h"),
+        ("shij", "shi j"),
+        ("xianz", "xian z"),
+        ("gongz", "gong z"),
+        ("zhid", "zhi d"),
+        ("zheg", "zhe g"),
+        ("jint", "jin t"),
+        ("went", "wen t"),
+        ("xiam", "xia m"),
+        ("jiam", "jia m"),
+        ("huam", "hua m"),
+        ("womend", "wo men d"),
+        ("xianzaish", "xian zai sh")
+    ]
+    var hijackedHalfTyped: [String] = []
+    for (raw, pre) in halfTypedCases {
+        let segCount = pre.split(separator: " ").count
+        let diag = PinyinTypoAugmenter.diagnose(rawInput: raw, preedit: pre)
+        let reps = PinyinTypoAugmenter.generateRepairs(rawInput: raw, diagnosis: diag, originalSegmentCount: segCount, maxCandidates: 3)
+        if !reps.isEmpty {
+            hijackedHalfTyped.append("\(raw)->\(reps.map(\.pinyin))")
+        }
+    }
+    if !hijackedHalfTyped.isEmpty {
+        print("  HALF_TYPED_HIJACKS: \(hijackedHalfTyped.joined(separator: "; "))")
+    }
+    assertCheck(hijackedHalfTyped.isEmpty, "PinyinTypoAugmenter never hijacks mid-typing or 全拼+简拼 words like liang'g / zhong'g / shen'm")
+
+    let repairChecks: [(String, String, PinyinTypoAugmenter.Diagnosis, Int)] = [
+        ("wozaijiabam", "wozaijiaban", .trailingInitial, 5),
+        ("nohao", "nihao", .broken, 3),
+        ("xiamzai", "xianzai", .broken, 4),
+        ("shjian", "shijian", .broken, 2),
+        ("xianzia", "xianzai", .suspicious, 3),
+        ("mingtiam", "mingtian", .broken, 4),
+        ("shemme", "shenme", .broken, 3),
+        ("wnti", "wenti", .broken, 3),
+        ("weixni", "weixin", .broken, 3)
     ]
     var missedRepairs: [String] = []
-    for (raw, expected) in repairChecks {
-        let got = PinyinTypoAugmenter.generateRepairs(rawInput: raw, maxCandidates: 3).map(\.pinyin)
+    for (raw, expected, diag, segCount) in repairChecks {
+        let got = PinyinTypoAugmenter.generateRepairs(rawInput: raw, diagnosis: diag, originalSegmentCount: segCount, maxCandidates: 3).map(\.pinyin)
         if !got.contains(expected) {
             missedRepairs.append("\(raw)->want:\(expected) got:\(got)")
         }
@@ -361,36 +399,48 @@ if let benchFlagIdx = CommandLine.arguments.firstIndex(of: "--bench") {
         if let ctx, ctx.selStart == 0 {
             let diag = PinyinTypoAugmenter.diagnose(rawInput: pinyin, preedit: ctx.preedit)
             if diag != .none {
-                let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: pinyin, maxCandidates: 3)
-                let queried = RimeEngine.shared.queryRepairedCandidates(
-                    sessionId: session,
-                    rawInputToRestore: pinyin,
-                    caretToRestore: pinyin.utf8.count,
-                    repairedInputs: repairs.map(\.pinyin)
-                )
-                var existing = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
-                var repairedCands: [PresentedCandidate] = []
-                for (idx, item) in queried.enumerated() {
-                    let key = CandidatePipeline.dedupeKey(for: item.text)
-                    guard !key.isEmpty, !existing.contains(key) else { continue }
-                    existing.insert(key)
-                    repairedCands.append(
-                        PresentedCandidate(
-                            text: item.text,
-                            comment: nil,
-                            originalRimeIndex: nil,
-                            isDirectCommit: true,
-                            isWholeSentence: true,
-                            baseRank: idx,
-                            repairedCode: item.repairedInput
-                        )
+                let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: pinyin, diagnosis: diag, originalSegmentCount: syl, maxCandidates: 3)
+                if !repairs.isEmpty {
+                    let queried = RimeEngine.shared.queryRepairedCandidates(
+                        sessionId: session,
+                        rawInputToRestore: pinyin,
+                        caretToRestore: pinyin.utf8.count,
+                        repairedInputs: repairs.map(\.pinyin)
                     )
-                }
-                if !repairedCands.isEmpty {
-                    if diag == .broken || repairedCands[0].text.count < (presented.first?.text.count ?? Int.max) {
-                        presented.insert(contentsOf: repairedCands, at: 0)
-                    } else {
-                        presented.insert(contentsOf: repairedCands, at: min(1, presented.count))
+                    var existing = Set(presented.map { CandidatePipeline.dedupeKey(for: $0.text) })
+                    var repairedCands: [PresentedCandidate] = []
+                    for (idx, item) in queried.enumerated() {
+                        let key = CandidatePipeline.dedupeKey(for: item.text)
+                        guard !key.isEmpty, !existing.contains(key) else { continue }
+                        existing.insert(key)
+                        repairedCands.append(
+                            PresentedCandidate(
+                                text: item.text,
+                                comment: nil,
+                                originalRimeIndex: nil,
+                                isDirectCommit: true,
+                                isWholeSentence: true,
+                                baseRank: idx,
+                                repairedCode: item.repairedInput
+                            )
+                        )
+                    }
+                    if !repairedCands.isEmpty {
+                        switch diag {
+                        case .broken:
+                            presented.insert(contentsOf: repairedCands, at: 0)
+                        case .trailingInitial:
+                            let rimeTopLen = presented.first?.text.count ?? 0
+                            let targetPos = (syl >= 4 || rimeTopLen < syl) ? 0 : min(1, presented.count)
+                            presented.insert(contentsOf: repairedCands, at: targetPos)
+                        case .suspicious:
+                            let targetPos = (repairedCands[0].text.count < (presented.first?.text.count ?? Int.max))
+                                ? 0
+                                : min(1, presented.count)
+                            presented.insert(contentsOf: repairedCands, at: targetPos)
+                        case .none:
+                            break
+                        }
                     }
                 }
             }

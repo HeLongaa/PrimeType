@@ -2807,7 +2807,12 @@ final class InputTypeController: IMKInputController {
                rawCaretForAugment == rawInputForAugment.utf8.count {
                 let diag = PinyinTypoAugmenter.diagnose(rawInput: rawInputForAugment, preedit: context.preedit)
                 if diag != .none {
-                    let repairs = PinyinTypoAugmenter.generateRepairs(rawInput: rawInputForAugment, maxCandidates: 3)
+                    let repairs = PinyinTypoAugmenter.generateRepairs(
+                        rawInput: rawInputForAugment,
+                        diagnosis: diag,
+                        originalSegmentCount: syllableCount,
+                        maxCandidates: 3
+                    )
                     if !repairs.isEmpty {
                         let queried = RimeEngine.shared.queryRepairedCandidates(
                             sessionId: sessionId,
@@ -2837,14 +2842,23 @@ final class InputTypeController: IMKInputController {
                         if !repairedCands.isEmpty {
                             // Insert repaired whole sentences right after any direct custom phrases
                             let insertPos = presented.firstIndex(where: { !($0.isDirectCommit && !$0.isWholeSentence) }) ?? presented.count
-                            if diag == .broken {
+                            switch diag {
+                            case .broken:
                                 presented.insert(contentsOf: repairedCands, at: insertPos)
-                            } else {
+                            case .trailingInitial:
+                                let rimeTopLen = presented.dropFirst(insertPos).first?.text.count ?? 0
+                                let targetPos = (syllableCount >= 4 || rimeTopLen < syllableCount)
+                                    ? insertPos
+                                    : min(insertPos + 1, presented.count)
+                                presented.insert(contentsOf: repairedCands, at: targetPos)
+                            case .suspicious:
                                 // `.suspicious`: promote ahead of fragmented Rime output when repaired is cleaner/shorter
                                 let rimeTopLen = presented.dropFirst(insertPos).first?.text.count ?? Int.max
                                 let repairLen = repairedCands[0].text.count
                                 let targetPos = (repairLen < rimeTopLen) ? insertPos : min(insertPos + 1, presented.count)
                                 presented.insert(contentsOf: repairedCands, at: targetPos)
+                            case .none:
+                                break
                             }
                         }
                     }
