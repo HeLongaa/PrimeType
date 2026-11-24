@@ -382,6 +382,37 @@ final class ClipboardManager: ObservableObject {
         saveToDisk()
     }
 
+    private let imageDecodeQueue = DispatchQueue(label: "com.lumocore.inputtype.clipboard.image", qos: .userInitiated)
+
+    /// Fast memory-only lookup for a 64px list thumbnail (0ms, never blocks main thread).
+    func cachedThumbnailImage(for entry: ClipboardEntry) -> NSImage? {
+        guard entry.kind == .image else { return nil }
+        return thumbnailCache.object(forKey: entry.id as NSUUID)
+    }
+
+    /// Loads a 64px thumbnail asynchronously off the main thread and caches it.
+    func loadThumbnailImageAsync(for entry: ClipboardEntry, completion: @escaping (NSImage?) -> Void) {
+        guard entry.kind == .image, let filename = entry.imageFilename else {
+            completion(nil)
+            return
+        }
+        let key = entry.id as NSUUID
+        if let cached = thumbnailCache.object(forKey: key) {
+            completion(cached)
+            return
+        }
+        let url = imagesDirURL.appendingPathComponent(filename)
+        imageDecodeQueue.async { [weak self] in
+            let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 64)
+            if let loaded, let self {
+                self.thumbnailCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
+            }
+            DispatchQueue.main.async {
+                completion(loaded?.image)
+            }
+        }
+    }
+
     /// Lightweight 64px thumbnail for the 24x24 list row icon (~16 KB decoded instead of ~20 MB full-res).
     func thumbnailImage(for entry: ClipboardEntry) -> NSImage? {
         guard entry.kind == .image, let filename = entry.imageFilename else { return nil }
@@ -393,6 +424,35 @@ final class ClipboardManager: ObservableObject {
         guard let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 64) else { return nil }
         thumbnailCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
         return loaded.image
+    }
+
+    /// Fast memory-only lookup for a 720px detail preview.
+    func cachedPreviewImage(for entry: ClipboardEntry) -> NSImage? {
+        guard entry.kind == .image else { return nil }
+        return previewCache.object(forKey: entry.id as NSUUID)
+    }
+
+    /// Loads a 720px detail preview asynchronously off the main thread and caches it.
+    func loadPreviewImageAsync(for entry: ClipboardEntry, completion: @escaping (NSImage?) -> Void) {
+        guard entry.kind == .image, let filename = entry.imageFilename else {
+            completion(nil)
+            return
+        }
+        let key = entry.id as NSUUID
+        if let cached = previewCache.object(forKey: key) {
+            completion(cached)
+            return
+        }
+        let url = imagesDirURL.appendingPathComponent(filename)
+        imageDecodeQueue.async { [weak self] in
+            let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 720)
+            if let loaded, let self {
+                self.previewCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
+            }
+            DispatchQueue.main.async {
+                completion(loaded?.image)
+            }
+        }
     }
 
     /// Downsampled 720px preview for the detail pane (~0.8-1.3 MB decoded; full PNG on disk is still used when pasting).
@@ -408,8 +468,31 @@ final class ClipboardManager: ObservableObject {
         return loaded.image
     }
 
+    /// Pre-decodes up to `limit` recent 64px thumbnails (~16 KB each) in the background so first panel open is instant.
+    func prewarmRecentThumbnails(limit: Int = 12) {
+        let imageEntries = entries.filter { $0.kind == .image && $0.imageFilename != nil }.prefix(limit)
+        guard !imageEntries.isEmpty else { return }
+        let items = Array(imageEntries)
+        imageDecodeQueue.async { [weak self] in
+            guard let self else { return }
+            for entry in items {
+                guard let filename = entry.imageFilename else { continue }
+                let key = entry.id as NSUUID
+                if self.thumbnailCache.object(forKey: key) != nil { continue }
+                let url = self.imagesDirURL.appendingPathComponent(filename)
+                if let loaded = Self.loadDownsampledImage(at: url, maxPixelSize: 64) {
+                    self.thumbnailCache.setObject(loaded.image, forKey: key, cost: loaded.cost)
+                }
+            }
+        }
+    }
+
     func image(for entry: ClipboardEntry) -> NSImage? {
         previewImage(for: entry)
+    }
+
+    func clearPreviewImageCache() {
+        previewCache.removeAllObjects()
     }
 
     func clearImageCache() {

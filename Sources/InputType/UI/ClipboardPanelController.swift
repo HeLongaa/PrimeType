@@ -23,31 +23,49 @@ private enum ClipboardFilterType: String, CaseIterable, Identifiable {
 }
 
 private enum ClipboardAppIconCache {
+    private static let lock = NSLock()
     private static var cache: [String: NSImage] = [:]
     private static let maxCachedIcons = 24
+    private static let fetchQueue = DispatchQueue(label: "com.lumocore.inputtype.clipboard.icons", qos: .userInitiated)
 
-    static func icon(forBundleID bundleID: String) -> NSImage? {
-        if let cached = cache[bundleID] {
-            return cached
+    static func cachedIcon(forBundleID bundleID: String) -> NSImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[bundleID]
+    }
+
+    static func loadIconAsync(forBundleID bundleID: String, completion: @escaping (NSImage?) -> Void) {
+        if let hit = cachedIcon(forBundleID: bundleID) {
+            completion(hit)
+            return
         }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-            return nil
+        fetchQueue.async {
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let rawIcon = NSWorkspace.shared.icon(forFile: url.path)
+            let targetSize = NSSize(width: 32, height: 32)
+            let small = NSImage(size: targetSize, flipped: false) { rect in
+                rawIcon.draw(in: rect)
+                return true
+            }
+            lock.lock()
+            if cache.count >= maxCachedIcons {
+                cache.removeAll(keepingCapacity: false)
+            }
+            cache[bundleID] = small
+            lock.unlock()
+            DispatchQueue.main.async {
+                completion(small)
+            }
         }
-        let rawIcon = NSWorkspace.shared.icon(forFile: url.path)
-        let targetSize = NSSize(width: 32, height: 32)
-        let small = NSImage(size: targetSize, flipped: false) { rect in
-            rawIcon.draw(in: rect)
-            return true
-        }
-        if cache.count >= maxCachedIcons {
-            cache.removeAll(keepingCapacity: false)
-        }
-        cache[bundleID] = small
-        return small
     }
 
     static func clear() {
+        lock.lock()
         cache.removeAll(keepingCapacity: false)
+        lock.unlock()
     }
 }
 
@@ -74,8 +92,13 @@ private enum ClipboardListRowModel {
     case entry(ClipboardEntry)
 }
 
+private final class ClipboardFlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private final class ClipboardActionControlView: NSView {
     var onClick: (() -> Void)?
+    override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { onClick?() }
@@ -104,16 +127,17 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
     private let splitDivider = NSView()
 
     // Right detail
-    private let rightContainer = NSView()
+    private let rightContainer = ClipboardFlippedView()
     private let previewImageView = NSImageView()
     private let previewTextScroll = NSScrollView()
     private let previewTextView = NSTextView()
-    private let metadataStack = NSView()
+    private let metadataStack = ClipboardFlippedView()
     private let emptyDetailLabel = NSTextField(labelWithString: "选择左侧条目查看详情")
-    private let actionPillHost = NSView()
+    private let actionPillHost = ClipboardFlippedView()
     private let pasteActionBtn = ClipboardActionControlView()
     private let pasteTitleLabel = NSTextField(labelWithString: "")
     private let actionsMenuBtn = ClipboardActionControlView()
+    private var activeDetailEntryID: UUID?
 
     override var isFlipped: Bool { true }
 
@@ -140,6 +164,17 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
 
     func focusSearchField() {
         window?.makeFirstResponder(searchField)
+    }
+
+    func prepareForDisplay() {
+        if searchField.stringValue != state.searchText {
+            searchField.stringValue = state.searchText
+        }
+        reloadData(scrollToSelection: true)
+    }
+
+    func clearTransientPreview() {
+        previewImageView.image = nil
     }
 
     private func setupSubviews() {
@@ -394,7 +429,9 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
 
     private func refreshDetail() {
         guard let entry = selectedEntry() else {
+            activeDetailEntryID = nil
             previewImageView.isHidden = true
+            previewImageView.image = nil
             previewTextScroll.isHidden = true
             metadataStack.isHidden = true
             actionPillHost.isHidden = true
@@ -402,14 +439,25 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             return
         }
 
+        activeDetailEntryID = entry.id
         emptyDetailLabel.isHidden = true
         metadataStack.isHidden = false
         actionPillHost.isHidden = false
 
-        if entry.kind == .image, let img = ClipboardManager.shared.previewImage(for: entry) {
-            previewImageView.isHidden = false
-            previewImageView.image = img
+        if entry.kind == .image {
             previewTextScroll.isHidden = true
+            previewImageView.isHidden = false
+            if let cached = ClipboardManager.shared.cachedPreviewImage(for: entry) {
+                previewImageView.image = cached
+            } else {
+                // Show tiny cached thumbnail immediately if available, then swap in 720px async
+                previewImageView.image = ClipboardManager.shared.cachedThumbnailImage(for: entry)
+                let targetID = entry.id
+                ClipboardManager.shared.loadPreviewImageAsync(for: entry) { [weak self] img in
+                    guard let self, self.activeDetailEntryID == targetID else { return }
+                    self.previewImageView.image = img
+                }
+            }
         } else {
             previewImageView.isHidden = true
             previewImageView.image = nil
@@ -425,7 +473,8 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
 
     private func rebuildMetadata(for entry: ClipboardEntry) {
         for sub in metadataStack.subviews { sub.removeFromSuperview() }
-        let w = max(200, rightContainer.bounds.width - 36)
+        let rightW = rightContainer.bounds.width > 0 ? rightContainer.bounds.width : (780 - 286)
+        let w = max(200, rightW - 36)
         var y: CGFloat = 0
 
         let header = NSTextField(labelWithString: "信息")
@@ -435,10 +484,9 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         metadataStack.addSubview(header)
         y += 20
 
-        var specs: [(label: String, value: String, icon: NSImage?)] = []
+        var specs: [(label: String, value: String, bundleID: String?)] = []
         if let appName = entry.sourceAppName {
-            let icon = entry.sourceAppBundleID.flatMap { ClipboardAppIconCache.icon(forBundleID: $0) }
-            specs.append(("来源", appName, icon))
+            specs.append(("来源", appName, entry.sourceAppBundleID))
         }
         specs.append(("种类", entry.kind.displayName, nil))
         if entry.kind == .image, let iw = entry.imageWidth, let ih = entry.imageHeight {
@@ -466,11 +514,19 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             valLbl.frame = NSRect(x: w - vw, y: y + 5, width: vw, height: 16)
             metadataStack.addSubview(valLbl)
 
-            if let icon = row.icon {
+            if let bundleID = row.bundleID {
                 let iv = NSImageView(frame: NSRect(x: w - vw - 21, y: y + 5.5, width: 15, height: 15))
-                iv.image = icon
                 iv.imageScaling = .scaleProportionallyUpOrDown
                 metadataStack.addSubview(iv)
+                if let cached = ClipboardAppIconCache.cachedIcon(forBundleID: bundleID) {
+                    iv.image = cached
+                } else {
+                    let targetID = entry.id
+                    ClipboardAppIconCache.loadIconAsync(forBundleID: bundleID) { [weak self, weak iv] icon in
+                        guard let self, self.activeDetailEntryID == targetID, let iv else { return }
+                        iv.image = icon
+                    }
+                }
             }
 
             y += rowH
@@ -537,7 +593,7 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
         lbl.sizeToFit()
         let w = ceil(lbl.fittingSize.width) + 10
         let h = ceil(lbl.fittingSize.height) + 4
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        let box = ClipboardFlippedView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         box.wantsLayer = true
         box.layer?.cornerCurve = .continuous
         box.layer?.cornerRadius = 4
@@ -632,13 +688,20 @@ private final class ClipboardContentNSView: NSView, NSTableViewDataSource, NSTab
             iconBox.layer?.cornerRadius = 6
             iconBox.layer?.masksToBounds = true
 
-            if entry.kind == .image, let thumb = ClipboardManager.shared.thumbnailImage(for: entry) {
+            if entry.kind == .image {
                 let iv = NSImageView(frame: iconBox.bounds)
-                iv.image = thumb
                 iv.imageScaling = .scaleAxesIndependently
                 iconBox.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
                 iconBox.layer?.borderWidth = 0.5
+                iconBox.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
                 iconBox.addSubview(iv)
+                if let thumb = ClipboardManager.shared.cachedThumbnailImage(for: entry) {
+                    iv.image = thumb
+                } else {
+                    ClipboardManager.shared.loadThumbnailImageAsync(for: entry) { [weak iv] loaded in
+                        iv?.image = loaded
+                    }
+                }
             } else {
                 iconBox.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.08).cgColor
                 let iv = NSImageView(frame: NSRect(x: 4, y: 4, width: 16, height: 16))
@@ -1138,6 +1201,18 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         }
     }
 
+    /// Pre-warms the pure-AppKit panel, Liquid Glass backdrop, recent thumbnails, and app icons off-screen
+    /// so even the very first hotkey press opens in < 5ms.
+    func warmUp() {
+        attachContentViewIfNeeded()
+        panel.contentView?.layoutSubtreeIfNeeded()
+        ClipboardManager.shared.prewarmRecentThumbnails(limit: 12)
+        let bundleIDs = Set(ClipboardManager.shared.entries.prefix(8).compactMap(\.sourceAppBundleID))
+        for bid in bundleIDs {
+            ClipboardAppIconCache.loadIconAsync(forBundleID: bid) { _ in }
+        }
+    }
+
     func toggle() {
         if panel.isVisible {
             hide(restoreFocus: true)
@@ -1160,6 +1235,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         )
 
         attachContentViewIfNeeded()
+        activeContentNSView?.prepareForDisplay()
         positionOnActiveScreen()
         panel.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
@@ -1181,13 +1257,12 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             NSApp.yieldActivation(to: target)
             target.activate()
         }
-        // Tear down SwiftUI view tree and image caches once hidden so clipboard UI & thumbnails
-        // do not stay resident in the background IME process.
+        // Keep the lightweight pure-AppKit view tree & 64px thumbnails warm for instant < 5ms reopen;
+        // only release large 720px detail preview buffers and return freed pages to macOS.
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.panel.isVisible else { return }
-            self.panel.contentView = nil
-            ClipboardAppIconCache.clear()
-            ClipboardManager.shared.clearImageCache()
+            self.activeContentNSView?.clearTransientPreview()
+            ClipboardManager.shared.clearPreviewImageCache()
             malloc_zone_pressure_relief(nil, 0)
         }
     }

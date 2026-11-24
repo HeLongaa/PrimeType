@@ -560,4 +560,12 @@ if InputSettings.shared.autoCheckAppUpdates {
         AppUpdateManager.shared.checkForUpdates(silent: true)
     }
 }
+// Warm up pure-AppKit popup surfaces (NSGlassEffectView / TextKit / thumbnails) during startup idle
+// so even the very first hotkey press opens in < 5ms without cold-start stutter.
+DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+    ClipboardPanelController.shared.warmUp()
+    _ = VModePanelController.shared
+    _ = VoiceHUDController.shared
+    _ = TranslatePopupController.shared
+}
 app.run()
