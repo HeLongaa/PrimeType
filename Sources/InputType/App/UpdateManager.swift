@@ -208,6 +208,15 @@ final class AppUpdateManager: ObservableObject {
 
                 try? fm.removeItem(at: tmpDir)
 
+                // If user enabled optional persistent local code-signing, re-sign in place so TCC permissions survive updates
+                if LocalCodeSignManager.shared.isCertificateConfigured() {
+                    await MainActor.run {
+                        self.downloadProgress = 0.95
+                        self.statusMessage = "正在使用本机签名证书重签…"
+                    }
+                    try? LocalCodeSignManager.resignInstalledAppIfConfigured()
+                }
+
                 await MainActor.run {
                     self.downloadProgress = 1.0
                     self.isUpdating = false

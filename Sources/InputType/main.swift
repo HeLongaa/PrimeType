@@ -87,6 +87,13 @@ if let server {
     if let candidates, candidates.responds(to: setSortingModesSel) {
         candidates.perform(setSortingModesSel, with: ["词频"])
     }
+    if let expandableCls = NSClassFromString("IMKUIExpandableCandidateWindowController") {
+        let sel = NSSelectorFromString("shouldShowSortingBar")
+        if let method = class_getInstanceMethod(expandableCls, sel) {
+            let block: @convention(block) (AnyObject) -> Bool = { _ in true }
+            method_setImplementation(method, imp_implementationWithBlock(block))
+        }
+    }
     candidates?.setDismissesAutomatically(false)
     candidates?.setAttributes([
         IMKCandidatesSendServerKeyEventFirst: NSNumber(value: true)

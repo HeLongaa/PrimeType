@@ -1,3 +1,4 @@
+import AVFoundation
 import Cocoa
 import SwiftUI
 import UniformTypeIdentifiers
@@ -954,48 +955,9 @@ private struct PhrasesAndClipboardSettingsView: View {
                         subtitle: "支持文本、图像、链接历史记录与按来源/类型筛选"
                     )
                 }
-
-                LabeledContent {
-                    if accessibilityGranted {
-                        Label("已授权", systemImage: "checkmark.circle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.green)
-                    } else {
-                        HStack(spacing: 8) {
-                            Button("定位应用") {
-                                ClipboardManager.shared.revealAppInFinder()
-                            }
-                            .help("在访达中显示 PrimeType.app，若列表中未出现可直接拖入辅助功能列表")
-
-                            Button("前往授权") {
-                                ClipboardManager.shared.requestAccessibilityPermission(openSystemSettings: true)
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                                    accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    SettingRowTitle(
-                        "辅助功能权限（图片/文件自动粘贴）",
-                        subtitle: "文本与链接默认通过输入法直接上屏；图片、文件或非 PrimeType 状态下自动粘贴需在「系统设置 → 隐私与安全性 → 辅助功能」中启用 PrimeType（若未自动列出，可点「定位应用」拖入）"
-                    )
-                }
             }
         }
         .formStyle(.grouped)
-        .onAppear {
-            accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
-        }
-        .onReceive(Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()) { _ in
-            let trusted = ClipboardManager.shared.isAccessibilityTrusted
-            if trusted != accessibilityGranted {
-                accessibilityGranted = trusted
-            }
-        }
     }
 }
 
@@ -1977,6 +1939,10 @@ private struct AdvancedSettingsView: View {
     @State private var showResetUserDBAlert = false
     @State private var showClearClipboardAlert = false
     @State private var showResetSettingsAlert = false
+    @State private var accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
+    @State private var micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    @State private var localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
+    @State private var isConfiguringLocalSign = false
 
     var body: some View {
         ZStack {
@@ -1988,16 +1954,31 @@ private struct AdvancedSettingsView: View {
                 .opacity(selectedTab == 1 ? 1 : 0)
                 .allowsHitTesting(selectedTab == 1)
 
-            diagnosticsTab
+            permissionsTab
                 .opacity(selectedTab == 2 ? 1 : 0)
                 .allowsHitTesting(selectedTab == 2)
+
+            diagnosticsTab
+                .opacity(selectedTab == 3 ? 1 : 0)
+                .allowsHitTesting(selectedTab == 3)
         }
         .toolbar {
             ToolbarItem(placement: .principal) {
                 NativeToolbarSegmentedControl(
-                    labels: ["数据", "引擎", "诊断"],
+                    labels: ["数据", "引擎", "权限", "诊断"],
                     selection: $selectedTab
                 )
+            }
+        }
+        .onAppear {
+            refreshPermissions()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPermissions()
+        }
+        .onReceive(Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()) { _ in
+            if selectedTab == 2 {
+                refreshPermissions()
             }
         }
         .alert("确定重置个人词频？", isPresented: $showResetUserDBAlert) {
@@ -2029,6 +2010,143 @@ private struct AdvancedSettingsView: View {
     }
 
     // MARK: - 1. 数据
+
+    private func refreshPermissions() {
+        accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
+        micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
+    }
+
+    private var permissionsTab: some View {
+        Form {
+            Section("系统权限状态") {
+                LabeledContent {
+                    if accessibilityGranted {
+                        Label("已授权", systemImage: "checkmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.green)
+                    } else {
+                        HStack(spacing: 8) {
+                            Button("定位应用") {
+                                ClipboardManager.shared.revealAppInFinder()
+                            }
+                            .help("在访达中显示 PrimeType.app，若列表中未出现可直接拖入辅助功能列表")
+
+                            Button("前往授权") {
+                                ClipboardManager.shared.requestAccessibilityPermission(openSystemSettings: true)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                                    refreshPermissions()
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    SettingRowTitle(
+                        "辅助功能权限（图片/文件自动粘贴）",
+                        subtitle: "文本与链接默认通过输入法直接上屏；图片、文件、划词翻译或非 PrimeType 状态下自动粘贴需在「系统设置 → 隐私与安全性 → 辅助功能」中启用 PrimeType（若未自动列出，可点「定位应用」拖入）"
+                    )
+                }
+
+                LabeledContent {
+                    if micAuthStatus == .authorized {
+                        Label("已授权", systemImage: "checkmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.green)
+                    } else {
+                        Button(micAuthStatus == .denied ? "打开设置" : "前往授权") {
+                            if micAuthStatus == .notDetermined {
+                                AVCaptureDevice.requestAccess(for: .audio) { _ in
+                                    DispatchQueue.main.async {
+                                        refreshPermissions()
+                                    }
+                                }
+                            } else if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+                } label: {
+                    SettingRowTitle(
+                        "麦克风权限（流式语音输入）",
+                        subtitle: "用于按住说话与点按听写语音识别；授权后可在任意应用中实时流式转写上屏"
+                    )
+                }
+            }
+
+            Section("安装引导") {
+                LabeledContent {
+                    Button("重新打开引导") {
+                        OnboardingWindowController.shared.show(initialStep: .addInputSource, openSettingsOnFinish: false)
+                    }
+                } label: {
+                    SettingRowTitle(
+                        "权限与安装引导向导",
+                        subtitle: "重新打开分步引导窗口，支持直接拖动 PrimeType.app 卡片至系统辅助功能列表"
+                    )
+                }
+            }
+
+            Section("持久化本地签名（进阶可选）") {
+                statusSection
+
+                LabeledContent {
+                    if isConfiguringLocalSign {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else if localSignConfigured {
+                        HStack(spacing: 10) {
+                            Label("已启用", systemImage: "checkmark.circle.fill")
+                                .font(.callout)
+                                .foregroundStyle(.green)
+                            Button("移除证书", role: .destructive) {
+                                isConfiguringLocalSign = true
+                                Task {
+                                    do {
+                                        try await LocalCodeSignManager.shared.removeCertificate()
+                                        await MainActor.run {
+                                            isConfiguringLocalSign = false
+                                            refreshPermissions()
+                                            showStatus("已从登录钥匙串移除本机签名证书", isError: false)
+                                        }
+                                    } catch {
+                                        await MainActor.run {
+                                            isConfiguringLocalSign = false
+                                            showStatus("移除证书失败：\(error.localizedDescription)", isError: true)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Button("配置本机签名") {
+                            isConfiguringLocalSign = true
+                            Task {
+                                do {
+                                    try await LocalCodeSignManager.shared.setupCertificateAndSignApp()
+                                    await MainActor.run {
+                                        isConfiguringLocalSign = false
+                                        refreshPermissions()
+                                        showStatus("已生成并信任本机签名证书，后续自动更新将免除重复授权", isError: false)
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        isConfiguringLocalSign = false
+                                        showStatus("配置失败：\(error.localizedDescription)", isError: true)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    SettingRowTitle(
+                        "本机自签名证书（免重复授权）",
+                        subtitle: "默认关闭。开启后会在您本机的登录钥匙串生成一张专属代码签名证书并重签 PrimeType.app，后续应用内自动更新将沿用该证书，不再丢失辅助功能与麦克风权限"
+                    )
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
 
     private var dataTab: some View {
         Form {

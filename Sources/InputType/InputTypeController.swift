@@ -1544,22 +1544,6 @@ final class InputTypeController: IMKInputController {
         let sel = Selector(("expand"))
         if candidatesWin.responds(to: sel) {
             candidatesWin.perform(sel)
-            if let ctrl = candidatesWin.value(forKey: "expandableWindowController") as? NSWindowController {
-                let sortingBarSel = NSSelectorFromString("sortingBarView")
-                if ctrl.responds(to: sortingBarSel),
-                   let bar = ctrl.perform(sortingBarSel)?.takeUnretainedValue() as? NSView {
-                    bar.isHidden = false
-                    if let win = ctrl.window {
-                        let barH = max(bar.frame.height, 28)
-                        var frame = win.frame
-                        if bar.frame.minY < 2 {
-                            frame.origin.y -= barH
-                            frame.size.height += barH
-                            win.setFrame(frame, display: true)
-                        }
-                    }
-                }
-            }
             elevateCandidateWindow(candidatesWin)
         }
     }
@@ -2428,11 +2412,10 @@ final class InputTypeController: IMKInputController {
                     let ctrl = candidatesWin.value(forKey: "expandableWindowController") as? NSWindowController
                     ctrl?.window?.animationBehavior = .none
                     let isWinVisible = ctrl?.window?.isVisible ?? false
+                    candidatesWin.update()
                     if !wasComposing || !isWinVisible {
                         candidatesWin.show(kIMKLocateCandidatesBelowHint)
                         elevateCandidateWindow(candidatesWin)
-                    } else {
-                        candidatesWin.update()
                     }
                     if AppUpdateManager.shared.hasUpdate {
                         UpdateBadgeOverlayController.shared.showIfAvailable(below: ctrl?.window)
