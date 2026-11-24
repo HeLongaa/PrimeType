@@ -552,8 +552,20 @@ final class InputTypeController: IMKInputController {
         }
         let modifiers = KeyCodeMapper.rimeModifiers(from: event.modifierFlags)
 
+        let wasComposingBeforeKey = !currentPreedit.isEmpty
         let handled = RimeEngine.shared.processKey(sessionId: sessionId, keyCode: keyCode, mask: modifiers)
         syncRimeState(client: client)
+
+        // macOS IMKInputController never delivers keyUp events. When Backspace clears the last
+        // composing character, emit a synthetic BackSpace release so Lua processors (e.g. wanxiang
+        // super_processor's backspace limiter) reset their hold sequence cleanly.
+        if wasComposingBeforeKey && currentPreedit.isEmpty && event.keyCode == 0x33 {
+            _ = RimeEngine.shared.processKey(
+                sessionId: sessionId,
+                keyCode: KeyCodeMapper.XK_BackSpace,
+                mask: modifiers | KeyCodeMapper.kReleaseMask
+            )
+        }
 
         if !handled && currentPreedit.isEmpty {
             return trackOrTransformUnhandledKey(event, client: client)
@@ -567,33 +579,39 @@ final class InputTypeController: IMKInputController {
         let settings = InputSettings.shared
         let mods = event.modifierFlags.intersection([.shift, .control, .option, .command])
 
-        // Backspace updates line buffer
-        if event.keyCode == 0x33 && mods.isEmpty {
-            if !currentLineBuffer.isEmpty {
-                currentLineBuffer.removeLast()
-                lastCommittedChar = currentLineBuffer.last
+        // Backspace / Forward Delete when NOT composing must ALWAYS pass straight through to the host app.
+        // Never route them into Rime, otherwise Lua processors expecting keyUp events (like wanxiang's
+        // enable_backspace_limit) can swallow Backspace and make deletion stop working (e.g. in Spotlight).
+        if event.keyCode == 0x33 || event.keyCode == 0x75 {
+            if event.keyCode == 0x33 && mods.isEmpty {
+                if !currentLineBuffer.isEmpty {
+                    currentLineBuffer.removeLast()
+                    lastCommittedChar = currentLineBuffer.last
+                } else {
+                    lastCommittedChar = nil
+                }
             } else {
-                lastCommittedChar = nil
+                resetInputContextTracking()
             }
-            return nil
+            return false
         }
 
-        // Navigation keys invalidate local line context
-        if [0x7b, 0x7c, 0x7d, 0x7e, 0x73, 0x77, 0x74, 0x79, 0x35].contains(event.keyCode) {
+        // Navigation, Escape, and Tab keys when NOT composing pass straight through to the host app
+        if [0x7b, 0x7c, 0x7d, 0x7e, 0x73, 0x77, 0x74, 0x79, 0x35, 0x30].contains(event.keyCode) {
             resetInputContextTracking()
-            return nil
+            return false
         }
 
-        // Auto-numbering on Return
-        if (event.keyCode == 0x24 || event.keyCode == 0x4c) && mods.isEmpty {
-            if settings.autoNumbering, let nextPrefix = nextAutoNumberPrefix(for: currentLineBuffer) {
+        // Auto-numbering on Return; otherwise pass Return straight through to the host app
+        if event.keyCode == 0x24 || event.keyCode == 0x4c {
+            if mods.isEmpty, settings.autoNumbering, let nextPrefix = nextAutoNumberPrefix(for: currentLineBuffer) {
                 insertRawText("\n" + nextPrefix, client: client)
                 currentLineBuffer = nextPrefix
                 lastCommittedChar = nextPrefix.last
                 return true
             }
             resetInputContextTracking()
-            return nil
+            return false
         }
 
         guard mods.subtracting([.shift]).isEmpty else { return nil }
@@ -633,6 +651,10 @@ final class InputTypeController: IMKInputController {
 
     private func handleDirectPassthroughCharacter(_ chars: String, client: (any IMKTextInput)?) -> Bool {
         guard chars.count == 1, let ch = chars.first, !ch.isNewline else {
+            return false
+        }
+        if let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1,
+           scalar.value < 0x20 || scalar.value == 0x7f {
             return false
         }
         let needsSpace = shouldInsertAutoSpace(previous: lastCommittedChar, next: ch)

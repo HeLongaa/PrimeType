@@ -1027,6 +1027,11 @@ final class InputSettings: ObservableObject {
             "  translator/enable_word_completion: \(smartSpelling ? "true" : "false")"
         ]
 
+        if preset == .wanxiang {
+            // macOS IMKInputController does not emit keyUp events; disable wanxiang's keyUp-dependent backspace lock.
+            lines.append("  super_processor/enable_backspace_limit: false")
+        }
+
         if fuzzyPinyinEnabled && !fuzzyRules.isEmpty {
             lines.append("  speller/algebra/+:")
             for rule in FuzzyPinyinRule.allCases where fuzzyRules.contains(rule) {
