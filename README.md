@@ -125,6 +125,12 @@ cd PrimeType
 
 ---
 
+## 社区
+
+感谢 LINUX DO 社区提供开放、友善的技术交流平台。
+
+---
+
 ## 开源许可
 
 本项目采用 [GNU AGPL-3.0](LICENSE) 许可证开源。第三方组件及词库许可详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
