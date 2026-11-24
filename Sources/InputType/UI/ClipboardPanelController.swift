@@ -1106,7 +1106,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
     private let panel: FloatingClipboardPanel
     private let guideOverlay = ClipboardGuideOverlayWindow()
     private let state = ClipboardPanelState()
-    private weak var activeContentNSView: ClipboardContentNSView?
+    private var activeContentNSView: ClipboardContentNSView?
     private var previousApp: NSRunningApplication?
     private var keyMonitor: Any?
 
@@ -1153,7 +1153,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
     }
 
     private func attachContentViewIfNeeded() {
-        guard panel.contentView == nil else { return }
+        guard activeContentNSView == nil else { return }
         let contentView = ClipboardContentNSView(
             state: state,
             onPaste: { [weak self] entry in
@@ -1170,7 +1170,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
         self.activeContentNSView = contentView
 
         if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView()
+            let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: 780, height: 500))
             glass.style = .regular
             glass.tintColor = nil
             glass.cornerRadius = 20
@@ -1181,7 +1181,7 @@ final class ClipboardPanelController: NSObject, NSWindowDelegate {
             glass.contentView = contentView
             panel.contentView = glass
         } else {
-            let effect = NSVisualEffectView()
+            let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 780, height: 500))
             effect.material = .hudWindow
             effect.blendingMode = .behindWindow
             effect.state = .active
