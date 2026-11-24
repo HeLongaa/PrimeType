@@ -127,7 +127,7 @@ cd PrimeType
 
 ## 社区
 
-感谢 LINUX DO 社区提供开放、友善的技术交流平台。
+感谢 [LINUX DO](https://linux.do/) 社区提供开放、友善的技术交流平台。
 
 ---
 
