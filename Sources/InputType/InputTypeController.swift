@@ -414,6 +414,31 @@ final class InputTypeController: IMKInputController {
         )
     }
 
+    override func recognizedEvents(_ sender: Any!) -> Int {
+        return Int(NSEvent.EventTypeMask.keyDown.rawValue | NSEvent.EventTypeMask.flagsChanged.rawValue)
+    }
+
+    override func cancelComposition() {
+        let targetClient = currentClient
+        if isVModeActive {
+            exitVMode(client: targetClient, clearMarked: true)
+        }
+        let hadMarked = !currentPreedit.isEmpty || asciiComposingBuffer != nil
+        asciiComposingBuffer = nil
+        if sessionId != 0 && (hadMarked || Self.latestActiveController === self) {
+            RimeEngine.shared.clearComposition(sessionId: sessionId)
+        }
+        currentPreedit = ""
+        currentCandidates = []
+        currentRimeCandidates = []
+        currentDirectCommitTexts = []
+        if hadMarked {
+            clearMarkedText(client: targetClient)
+        }
+        hideCandidatesImmediately()
+        super.cancelComposition()
+    }
+
     override func commitComposition(_ sender: Any!) {
         let targetClient = sender as? (any IMKTextInput) ?? currentClient
         if isVModeActive {
@@ -425,10 +450,11 @@ final class InputTypeController: IMKInputController {
             currentCandidates = []
             currentRimeCandidates = []
             currentDirectCommitTexts = []
-            clearMarkedText(client: targetClient)
             hideCandidatesImmediately()
             if !asciiBuffer.isEmpty {
                 insertProcessedText(asciiBuffer, client: targetClient, allowAutoPair: false)
+            } else {
+                clearMarkedText(client: targetClient)
             }
             return
         }
@@ -440,9 +466,11 @@ final class InputTypeController: IMKInputController {
             currentDirectCommitTexts = []
             return
         }
+        var didCommit = false
         if RimeEngine.shared.commitComposition(sessionId: sessionId) {
             if let commitText = RimeEngine.shared.getCommitText(sessionId: sessionId), !commitText.isEmpty {
                 insertProcessedText(commitText, client: targetClient, allowAutoPair: false)
+                didCommit = true
             }
         }
         RimeEngine.shared.clearComposition(sessionId: sessionId)
@@ -450,7 +478,9 @@ final class InputTypeController: IMKInputController {
         currentCandidates = []
         currentRimeCandidates = []
         currentDirectCommitTexts = []
-        if hadPreedit {
+        // Per Apple IMKTextInput contract, insertText already replaces marked text and unmarks it.
+        // Only send setMarkedText("") when clearing an uncommitted composition.
+        if hadPreedit && !didCommit {
             clearMarkedText(client: targetClient)
         }
         hideCandidatesImmediately()
@@ -915,7 +945,7 @@ final class InputTypeController: IMKInputController {
 
     private func commitVModeText(_ text: String, client: (any IMKTextInput)?) {
         let target = client ?? currentClient
-        exitVMode(client: target, clearMarked: true)
+        exitVMode(client: target, clearMarked: text.isEmpty)
         guard !text.isEmpty else { return }
         insertProcessedText(text, client: target, allowAutoPair: false)
     }
@@ -1850,9 +1880,12 @@ final class InputTypeController: IMKInputController {
             currentCandidates = []
             currentRimeCandidates = []
             currentDirectCommitTexts = []
-            clearMarkedText(client: client)
             hideCandidatesImmediately()
-            insertProcessedText(text, client: client, allowAutoPair: false)
+            if !text.isEmpty {
+                insertProcessedText(text, client: client, allowAutoPair: false)
+            } else {
+                clearMarkedText(client: client)
+            }
             return
         }
 
@@ -2367,8 +2400,10 @@ final class InputTypeController: IMKInputController {
         }
         asciiComposingBuffer = nil
 
+        var didCommit = false
         if let commitText = RimeEngine.shared.getCommitText(sessionId: sessionId), !commitText.isEmpty {
             insertProcessedText(commitText, client: client, allowAutoPair: true)
+            didCommit = true
         }
 
         guard let context = RimeEngine.shared.getContext(sessionId: sessionId) else {
@@ -2377,7 +2412,10 @@ final class InputTypeController: IMKInputController {
             currentCandidates = []
             currentRimeCandidates = []
             currentDirectCommitTexts = []
-            if hadPreedit {
+            // insertText already replaces marked text and exits composition mode;
+            // calling setMarkedText("") afterward violates IMKTextInput and breaks Backspace
+            // in strict NSTextView / Spotlight / WKWebView clients (e.g. Gemini Mac app).
+            if hadPreedit && !didCommit {
                 clearMarkedText(client: client)
             }
             hideCandidatesImmediately()
@@ -2390,7 +2428,7 @@ final class InputTypeController: IMKInputController {
             currentCandidates = []
             currentRimeCandidates = []
             currentDirectCommitTexts = []
-            if hadPreedit {
+            if hadPreedit && !didCommit {
                 clearMarkedText(client: client)
             }
             hideCandidatesImmediately()
