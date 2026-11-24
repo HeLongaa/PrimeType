@@ -245,6 +245,9 @@ final class AppUpdateManager: ObservableObject {
 
                 // Exit cleanly so macOS InputMethodKit immediately relaunches the updated PrimeType.app
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    #if PRIMETYPE_SETTINGS_HELPER
+                    PrimeTypeIPC.post(PrimeTypeIPC.restartIME)
+                    #endif
                     NSApp.terminate(nil)
                 }
             } catch {

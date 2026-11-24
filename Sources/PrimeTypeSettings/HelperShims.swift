@@ -148,20 +148,13 @@ final class VoiceInputManager: ObservableObject {
             PrimeTypeIPC.post(PrimeTypeIPC.syncVoiceMic)
             return
         }
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        let rawStatus = PrimeTypeIPC.readMetrics()?.micAuthStatusRaw
+        let status = rawStatus.flatMap { AVAuthorizationStatus(rawValue: $0) } ?? .notDetermined
         switch status {
         case .authorized:
             PrimeTypeIPC.post(PrimeTypeIPC.syncVoiceMic)
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                DispatchQueue.main.async {
-                    if granted {
-                        PrimeTypeIPC.post(PrimeTypeIPC.syncVoiceMic)
-                    } else {
-                        InputSettings.shared.voiceAlwaysOnMic = false
-                    }
-                }
-            }
+            PrimeTypeIPC.post(PrimeTypeIPC.requestMicrophone)
         default:
             InputSettings.shared.voiceAlwaysOnMic = false
         }

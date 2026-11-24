@@ -24,7 +24,9 @@ final class SettingsHelperAppDelegate: NSObject, NSApplicationDelegate {
         )
 
         let args = CommandLine.arguments
-        if args.contains("--onboarding") {
+        if args.contains("--onboarding-accessibility") {
+            OnboardingWindowController.shared.show(initialStep: .accessibility, openSettingsOnFinish: false)
+        } else if args.contains("--onboarding") {
             OnboardingWindowController.shared.show(openSettingsOnFinish: true)
         } else if args.contains("--onboarding-only") {
             OnboardingWindowController.shared.show(openSettingsOnFinish: false)
@@ -42,6 +44,8 @@ final class SettingsHelperAppDelegate: NSObject, NSApplicationDelegate {
             switch arg {
             case "--about":
                 SettingsWindowController.shared.showAbout()
+            case "--onboarding-accessibility":
+                OnboardingWindowController.shared.show(initialStep: .accessibility, openSettingsOnFinish: false)
             case "--onboarding":
                 OnboardingWindowController.shared.show(openSettingsOnFinish: true)
             case "--onboarding-only":

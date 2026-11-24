@@ -1,3 +1,5 @@
+import AVFoundation
+import ApplicationServices
 import Cocoa
 import Darwin
 import Foundation
@@ -20,6 +22,9 @@ enum PrimeTypeIPC {
     static let requestMetrics = "com.lumocore.inputmethod.PrimeType.ipc.requestMetrics"
     static let metricsUpdated = "com.lumocore.inputmethod.PrimeType.ipc.metricsUpdated"
     static let importBackupDone = "com.lumocore.inputmethod.PrimeType.ipc.importBackupDone"
+    static let requestAccessibility = "com.lumocore.inputmethod.PrimeType.ipc.requestAccessibility"
+    static let requestMicrophone = "com.lumocore.inputmethod.PrimeType.ipc.requestMicrophone"
+    static let restartIME = "com.lumocore.inputmethod.PrimeType.ipc.restartIME"
 
     struct RuntimeMetrics: Codable {
         var sampleCount: Int
@@ -35,7 +40,25 @@ enum PrimeTypeIPC {
         var userRankingEntryCount: Int
         var localRerankerStateRaw: String
         var currentPresetRaw: String
+        var accessibilityGranted: Bool?
+        var micAuthStatusRaw: Int?
         var updatedAt: TimeInterval
+    }
+
+    static var parentIMEBundleURL: URL {
+        #if PRIMETYPE_SETTINGS_HELPER
+        // PrimeType.app/Contents/Helpers/PrimeTypeSettings.app -> PrimeType.app
+        let candidate = Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        if candidate.pathExtension == "app" {
+            return candidate
+        }
+        return URL(fileURLWithPath: "/Library/Input Methods/PrimeType.app")
+        #else
+        return Bundle.main.bundleURL
+        #endif
     }
 
     static var metricsFileURL: URL {
@@ -86,7 +109,6 @@ enum PrimeTypeIPC {
 /// sent back from the Settings/Onboarding helper to the resident IME process.
 final class SettingsHelperLauncher {
     static let shared = SettingsHelperLauncher()
-    private static let onboardingCompletedKey = "com.lumocore.inputtype.onboardingCompleted"
     private var isListening = false
 
     private init() {}
@@ -123,8 +145,39 @@ final class SettingsHelperLauncher {
     }
 
     func showOnboardingIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: Self.onboardingCompletedKey) else { return }
-        showOnboarding(openSettingsOnFinish: true)
+        let settings = InputSettings.shared
+        let shortVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+        let buildVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        let currentFullVersion = "\(shortVer) (\(buildVer))"
+
+        if !settings.hasCompletedOnboarding {
+            settings.lastLaunchedVersion = currentFullVersion
+            let axGranted = AXIsProcessTrusted() || CGPreflightPostEventAccess()
+            let micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            if axGranted && micGranted {
+                settings.hasCompletedOnboarding = true
+                return
+            }
+            showOnboarding(openSettingsOnFinish: true)
+            return
+        }
+
+        // Post-update check: if app version changed and Accessibility permission was invalidated
+        // (due to ad-hoc signing CDHash change), clean stale TCC entry and show quick re-auth card.
+        let previousVersion = settings.lastLaunchedVersion
+        if previousVersion != currentFullVersion {
+            settings.lastLaunchedVersion = currentFullVersion
+            let axGranted = AXIsProcessTrusted() || CGPreflightPostEventAccess()
+            if !previousVersion.isEmpty && !axGranted {
+                let reset = Process()
+                reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+                reset.arguments = ["reset", "Accessibility", "com.lumocore.inputmethod.PrimeType"]
+                try? reset.run()
+                reset.waitUntilExit()
+                publishRuntimeMetrics()
+                launchHelper(arguments: ["--onboarding-accessibility"])
+            }
+        }
     }
 
     private func launchHelper(arguments: [String]) {
@@ -172,7 +225,10 @@ final class SettingsHelperLauncher {
             PrimeTypeIPC.syncVoiceMic,
             PrimeTypeIPC.unloadLocalReranker,
             PrimeTypeIPC.requestMetrics,
-            PrimeTypeIPC.importBackupDone
+            PrimeTypeIPC.importBackupDone,
+            PrimeTypeIPC.requestAccessibility,
+            PrimeTypeIPC.requestMicrophone,
+            PrimeTypeIPC.restartIME
         ]
         for name in names {
             PrimeTypeIPC.observe(name, observer: self) { _, _, cfName, _, _ in
@@ -182,6 +238,7 @@ final class SettingsHelperLauncher {
                 }
             }
         }
+        publishRuntimeMetrics()
     }
 
     func publishRuntimeMetrics() {
@@ -200,6 +257,8 @@ final class SettingsHelperLauncher {
             userRankingEntryCount: UserRankingEngine.shared.entryCount,
             localRerankerStateRaw: LocalNeuralReranker.shared.runtimeState.rawValue,
             currentPresetRaw: RimeEngine.shared.currentPreset.rawValue,
+            accessibilityGranted: ClipboardManager.shared.isAccessibilityTrusted,
+            micAuthStatusRaw: AVCaptureDevice.authorizationStatus(for: .audio).rawValue,
             updatedAt: Date().timeIntervalSince1970
         )
         PrimeTypeIPC.writeMetrics(metrics)
@@ -262,6 +321,28 @@ final class SettingsHelperLauncher {
 
         case PrimeTypeIPC.requestMetrics:
             publishRuntimeMetrics()
+
+        case PrimeTypeIPC.requestAccessibility:
+            ClipboardManager.shared.requestAccessibilityPermission(openSystemSettings: false)
+            publishRuntimeMetrics()
+
+        case PrimeTypeIPC.requestMicrophone:
+            let status = AVCaptureDevice.authorizationStatus(for: .audio)
+            if status == .notDetermined {
+                AVCaptureDevice.requestAccess(for: .audio) { _ in
+                    DispatchQueue.main.async {
+                        VoiceInputManager.shared.syncMicrophonePreference()
+                        SettingsHelperLauncher.shared.publishRuntimeMetrics()
+                    }
+                }
+            } else {
+                publishRuntimeMetrics()
+            }
+
+        case PrimeTypeIPC.restartIME:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                NSApp.terminate(nil)
+            }
 
         case PrimeTypeIPC.importBackupDone:
             RimeEngine.shared.shutdown()

@@ -110,7 +110,7 @@ final class LocalCodeSignManager {
             // 4. Clear stale Accessibility TCC record so the restarted process prompts cleanly once for the new certificate
             _ = try? Self.run("/usr/bin/tccutil", [
                 "reset", "Accessibility",
-                Bundle.main.bundleIdentifier ?? "com.lumocore.inputmethod.PrimeType"
+                "com.lumocore.inputmethod.PrimeType"
             ])
         }.value
 

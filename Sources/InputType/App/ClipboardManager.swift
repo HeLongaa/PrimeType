@@ -425,13 +425,21 @@ final class ClipboardManager: ObservableObject {
     }
 
     var isAccessibilityTrusted: Bool {
-        AXIsProcessTrusted() || CGPreflightPostEventAccess()
+        #if PRIMETYPE_SETTINGS_HELPER
+        return PrimeTypeIPC.readMetrics()?.accessibilityGranted ?? false
+        #else
+        return AXIsProcessTrusted() || CGPreflightPostEventAccess()
+        #endif
     }
 
     func requestAccessibilityPermission(openSystemSettings: Bool = false) {
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.requestAccessibility)
+        #else
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
         _ = CGRequestPostEventAccess()
+        #endif
         if openSystemSettings,
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
@@ -439,7 +447,7 @@ final class ClipboardManager: ObservableObject {
     }
 
     func revealAppInFinder() {
-        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        NSWorkspace.shared.activateFileViewerSelecting([PrimeTypeIPC.parentIMEBundleURL])
     }
 
     func copyToPasteboard(_ entry: ClipboardEntry) {

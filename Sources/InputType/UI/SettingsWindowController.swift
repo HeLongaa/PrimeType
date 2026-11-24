@@ -1947,7 +1947,7 @@ private struct AdvancedSettingsView: View {
     @State private var showClearClipboardAlert = false
     @State private var showResetSettingsAlert = false
     @State private var accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
-    @State private var micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    @State private var micAuthStatus: AVAuthorizationStatus = Self.currentMicAuthStatus()
     @State private var localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
     @State private var isConfiguringLocalSign = false
     @State private var latencySnapshot = LatencyProbe.shared.snapshot()
@@ -2026,10 +2026,31 @@ private struct AdvancedSettingsView: View {
 
     // MARK: - 1. 数据
 
+    private static func currentMicAuthStatus() -> AVAuthorizationStatus {
+        #if PRIMETYPE_SETTINGS_HELPER
+        if let raw = PrimeTypeIPC.readMetrics()?.micAuthStatusRaw,
+           let status = AVAuthorizationStatus(rawValue: raw) {
+            return status
+        }
+        return .notDetermined
+        #else
+        return AVCaptureDevice.authorizationStatus(for: .audio)
+        #endif
+    }
+
     private func refreshPermissions() {
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.requestMetrics)
+        #endif
         accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
-        micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        micAuthStatus = Self.currentMicAuthStatus()
         localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
+        #if PRIMETYPE_SETTINGS_HELPER
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
+            micAuthStatus = Self.currentMicAuthStatus()
+        }
+        #endif
     }
 
     private var permissionsTab: some View {
@@ -2070,11 +2091,18 @@ private struct AdvancedSettingsView: View {
                     } else {
                         Button(micAuthStatus == .denied ? "打开设置" : "前往授权") {
                             if micAuthStatus == .notDetermined {
+                                #if PRIMETYPE_SETTINGS_HELPER
+                                PrimeTypeIPC.post(PrimeTypeIPC.requestMicrophone)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                                    refreshPermissions()
+                                }
+                                #else
                                 AVCaptureDevice.requestAccess(for: .audio) { _ in
                                     DispatchQueue.main.async {
                                         refreshPermissions()
                                     }
                                 }
+                                #endif
                             } else if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
                                 NSWorkspace.shared.open(url)
                             }

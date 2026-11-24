@@ -124,8 +124,8 @@ private struct OnboardingWizardView: View {
     @ObservedObject private var settings = InputSettings.shared
     @State private var step: OnboardingStep
     @State private var inputSourceAdded: Bool = Self.checkInputSourceEnabled()
-    @State private var micStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-    @State private var axGranted: Bool = AXIsProcessTrusted()
+    @State private var micStatus: AVAuthorizationStatus = Self.currentMicAuthStatus()
+    @State private var axGranted: Bool = ClipboardManager.shared.isAccessibilityTrusted
     @State private var isRecordingShortcut = false
     @State private var shortcutMonitor: Any?
 
@@ -179,11 +179,10 @@ private struct OnboardingWizardView: View {
         }
         .frame(width: 780, height: 500)
         .onAppear {
-            micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-            axGranted = AXIsProcessTrusted()
+            refreshStatus()
         }
         .onChange(of: step) { _, newStep in
-            if newStep == .microphone && AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            if newStep == .microphone && Self.currentMicAuthStatus() == .notDetermined {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     requestMicrophoneAccess()
                 }
@@ -193,8 +192,7 @@ private struct OnboardingWizardView: View {
             stopRecordingShortcut()
         }
         .onReceive(pollTimer) { _ in
-            micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-            axGranted = AXIsProcessTrusted()
+            refreshStatus()
         }
     }
 
@@ -538,12 +536,12 @@ private struct OnboardingWizardView: View {
                             .stroke(axGranted ? Color.green.opacity(0.35) : brandBlue.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: axGranted ? [] : [4, 3]))
                     )
                     .onDrag {
-                        NSItemProvider(object: Bundle.main.bundleURL as NSURL)
+                        NSItemProvider(object: PrimeTypeIPC.parentIMEBundleURL as NSURL)
                     }
 
                     if !axGranted {
                         Button {
-                            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+                            NSWorkspace.shared.activateFileViewerSelecting([PrimeTypeIPC.parentIMEBundleURL])
                         } label: {
                             Label("在访达中显示 PrimeType.app", systemImage: "folder")
                                 .font(.system(size: 12))
@@ -603,25 +601,46 @@ private struct OnboardingWizardView: View {
         return !list.isEmpty
     }
 
+    private static func currentMicAuthStatus() -> AVAuthorizationStatus {
+        #if PRIMETYPE_SETTINGS_HELPER
+        if let raw = PrimeTypeIPC.readMetrics()?.micAuthStatusRaw,
+           let status = AVAuthorizationStatus(rawValue: raw) {
+            return status
+        }
+        return .notDetermined
+        #else
+        return AVCaptureDevice.authorizationStatus(for: .audio)
+        #endif
+    }
+
+    private func refreshStatus() {
+        #if PRIMETYPE_SETTINGS_HELPER
+        PrimeTypeIPC.post(PrimeTypeIPC.requestMetrics)
+        #endif
+        inputSourceAdded = Self.checkInputSourceEnabled()
+        micStatus = Self.currentMicAuthStatus()
+        axGranted = ClipboardManager.shared.isAccessibilityTrusted
+    }
+
     private func requestMicrophoneAccess() {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        let status = Self.currentMicAuthStatus()
         if status == .notDetermined {
+            #if PRIMETYPE_SETTINGS_HELPER
+            PrimeTypeIPC.post(PrimeTypeIPC.requestMicrophone)
+            #else
             AVCaptureDevice.requestAccess(for: .audio) { _ in
                 DispatchQueue.main.async {
                     micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
                 }
             }
+            #endif
         } else if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
             NSWorkspace.shared.open(url)
         }
     }
 
     private func requestAccessibilityAccess() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
+        ClipboardManager.shared.requestAccessibilityPermission(openSystemSettings: true)
     }
 
     private func toggleRecordingShortcut() {
