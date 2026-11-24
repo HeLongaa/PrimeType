@@ -26,13 +26,31 @@ PrimeType (Prime 输入法) 使用或分发了以下第三方开源软件与词�
 |---|---|---|---|---|
 | **雾凇拼音（rime-ice）** | 上游主干 | https://github.com/iDvel/rime-ice | GPL-3.0-only | `Contents/Resources/SharedSupport/` |
 | **薄荷拼音（oh-my-rime）** | 上游发行版 | https://github.com/Mintimate/oh-my-rime | GPL-3.0 | `Contents/Resources/Dictionaries/oh_my_rime/` |
-| **万象拼音（rime-wanxiang）** | `18.2.0` | https://github.com/amzxyz/rime-wanxiang | CC-BY-4.0 | `Contents/Resources/Dictionaries/wanxiang/` |
+| **万象拼音（rime_wanxiang）** | `18.2.0` | https://github.com/amzxyz/rime_wanxiang | CC-BY-4.0 | `Contents/Resources/Dictionaries/wanxiang/` |
 
 ---
 
-## 3. 许可证声明摘要
+## 3. 表情与符号数据
 
-### 3.1 librime 及 Rime 插件（BSD-3-Clause）
+| 组件名称 | 项目主页 | 许可证 | 说明 |
+|---|---|---|---|
+| **rime-emoji** | https://github.com/rime/rime-emoji | LGPL-3.0 | Rime 表情候选数据 |
+| **emojibase** | https://github.com/milesj/emojibase | MIT | Unicode 表情与符号元数据 |
+
+---
+
+## 4. 语音输入与底层音频参考（致谢）
+
+| 项目名称 | 项目主页 | 类型 | 说明 |
+|---|---|---|---|
+| **VoiceKey (`J3n5en/voicekey`)** | https://github.com/J3n5en/voicekey | 参考致谢 | 参考其语音输入交互实现 |
+| **Handy / VoiceInk** | https://github.com/Beingpax/VoiceInk | 参考致谢 | 参考底层 CoreAudio 低延迟采集机制 |
+
+---
+
+## 5. 许可证声明摘要
+
+### 5.1 librime 及 Rime 插件（BSD-3-Clause）
 
 ```text
 Copyright (c) 2011-present, Rime Developers (librime, librime-lua, librime-octagram, librime-predict contributors)
@@ -65,7 +83,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-### 3.2 libopus（BSD-3-Clause）
+### 5.2 libopus（BSD-3-Clause）
 
 完整许可证原文位于 [Vendor/opus/LICENSE](Vendor/opus/LICENSE)：
 
@@ -111,13 +129,20 @@ Opus is subject to the royalty-free patent licenses specified at:
 
 ---
 
-### 3.3 雾凇拼音（rime-ice）与薄荷拼音（oh-my-rime）— GNU GPL v3.0
+### 5.3 雾凇拼音（rime-ice）与薄荷拼音（oh-my-rime）— GNU GPL v3.0
 
 - **雾凇拼音（rime-ice）**：依据 GNU General Public License v3.0 only 授权，完整许可证文本随词库分发于 `Contents/Resources/SharedSupport/LICENSE`，源码地址：https://github.com/iDvel/rime-ice 。
 - **薄荷拼音（oh-my-rime）**：依据 GNU General Public License v3.0 授权，完整许可证文本随词库分发于 `Contents/Resources/Dictionaries/oh_my_rime/LICENSE`，源码地址：https://github.com/Mintimate/oh-my-rime 。
 
 ---
 
-### 3.4 万象拼音（rime-wanxiang）— CC BY 4.0
+### 5.4 万象拼音（rime_wanxiang）— CC BY 4.0
 
-- **万象拼音（rime-wanxiang）**：依据 [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/) 许可协议授权，项目主页：https://github.com/amzxyz/rime-wanxiang 。
+- **万象拼音（rime_wanxiang）**：依据 [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/)（[中文说明](https://creativecommons.org/licenses/by/4.0/deed.zh-hans)）许可协议授权，作者 `amzxyz`，项目主页：https://github.com/amzxyz/rime_wanxiang 。
+
+---
+
+### 5.5 表情与符号数据（LGPL-3.0 / MIT）
+
+- **rime-emoji**：依据 GNU Lesser General Public License v3.0 (LGPL-3.0) 授权，项目主页：https://github.com/rime/rime-emoji 。
+- **emojibase**：依据 MIT 许可证授权，项目主页：https://github.com/milesj/emojibase 。
