@@ -1948,7 +1948,8 @@ private struct AdvancedSettingsView: View {
     @State private var showResetSettingsAlert = false
     @State private var accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
     @State private var micAuthStatus: AVAuthorizationStatus = Self.currentMicAuthStatus()
-    @State private var localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
+    @State private var localSignConfigured: Bool?
+    @State private var localSignRefresh: Task<Void, Never>?
     @State private var isConfiguringLocalSign = false
     @State private var latencySnapshot = LatencyProbe.shared.snapshot()
     @State private var rankingEntryCount = UserRankingEngine.shared.entryCount
@@ -1995,6 +1996,9 @@ private struct AdvancedSettingsView: View {
             } else if selectedTab == 3 {
                 latencySnapshot = LatencyProbe.shared.snapshot()
             }
+        }
+        .onDisappear {
+            cancelLocalSignRefresh()
         }
         .alert("确定重置个人词频？", isPresented: $showResetUserDBAlert) {
             Button("取消", role: .cancel) {}
@@ -2044,13 +2048,30 @@ private struct AdvancedSettingsView: View {
         #endif
         accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
         micAuthStatus = Self.currentMicAuthStatus()
-        localSignConfigured = LocalCodeSignManager.shared.isCertificateConfigured()
+        refreshLocalSignStatus()
         #if PRIMETYPE_SETTINGS_HELPER
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             accessibilityGranted = ClipboardManager.shared.isAccessibilityTrusted
             micAuthStatus = Self.currentMicAuthStatus()
         }
         #endif
+    }
+
+    private func refreshLocalSignStatus() {
+        guard localSignRefresh == nil, !isConfiguringLocalSign else { return }
+        localSignRefresh = Task { @MainActor in
+            let configured = await Task.detached(priority: .utility) {
+                LocalCodeSignManager.shared.isCertificateConfigured()
+            }.value
+            guard !Task.isCancelled else { return }
+            localSignConfigured = configured
+            localSignRefresh = nil
+        }
+    }
+
+    private func cancelLocalSignRefresh() {
+        localSignRefresh?.cancel()
+        localSignRefresh = nil
     }
 
     private var permissionsTab: some View {
@@ -2133,52 +2154,50 @@ private struct AdvancedSettingsView: View {
                 statusSection
 
                 LabeledContent {
-                    if isConfiguringLocalSign {
+                    if isConfiguringLocalSign || localSignConfigured == nil {
                         ProgressView()
                             .controlSize(.small)
-                    } else if localSignConfigured {
+                    } else if localSignConfigured == true {
                         HStack(spacing: 10) {
                             Label("已启用", systemImage: "checkmark.circle.fill")
                                 .font(.callout)
                                 .foregroundStyle(.green)
                             Button("移除证书", role: .destructive) {
+                                cancelLocalSignRefresh()
                                 isConfiguringLocalSign = true
-                                Task {
+                                Task { @MainActor in
+                                    defer {
+                                        localSignConfigured = nil
+                                        isConfiguringLocalSign = false
+                                        refreshPermissions()
+                                    }
                                     do {
                                         try await LocalCodeSignManager.shared.removeCertificate()
-                                        await MainActor.run {
-                                            isConfiguringLocalSign = false
-                                            refreshPermissions()
-                                            showStatus("已从登录钥匙串移除本机签名证书", isError: false)
-                                        }
+                                        showStatus("已从登录钥匙串移除本机签名证书", isError: false)
                                     } catch {
-                                        await MainActor.run {
-                                            isConfiguringLocalSign = false
-                                            showStatus("移除证书失败：\(error.localizedDescription)", isError: true)
-                                        }
+                                        showStatus("移除证书失败：\(error.localizedDescription)", isError: true)
                                     }
                                 }
                             }
                         }
                     } else {
                         Button("配置本机签名") {
+                            cancelLocalSignRefresh()
                             isConfiguringLocalSign = true
-                            Task {
+                            Task { @MainActor in
+                                defer {
+                                    localSignConfigured = nil
+                                    isConfiguringLocalSign = false
+                                    refreshPermissions()
+                                }
                                 do {
                                     try await LocalCodeSignManager.shared.setupCertificateAndSignApp()
-                                    await MainActor.run {
-                                        isConfiguringLocalSign = false
-                                        refreshPermissions()
-                                        showStatus("已启用本机签名，正在重启输入法以生效…", isError: false)
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                                            NSApp.terminate(nil)
-                                        }
+                                    showStatus("已启用本机签名，正在重启输入法以生效…", isError: false)
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                        NSApp.terminate(nil)
                                     }
                                 } catch {
-                                    await MainActor.run {
-                                        isConfiguringLocalSign = false
-                                        showStatus("配置失败：\(error.localizedDescription)", isError: true)
-                                    }
+                                    showStatus("配置失败：\(error.localizedDescription)", isError: true)
                                 }
                             }
                         }
